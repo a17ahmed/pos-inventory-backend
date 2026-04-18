@@ -29,8 +29,10 @@
     "multer-storage-cloudinary": "^4.0.0",
     "node-cache": "^5.1.2",
     "nodemailer": "^6.9.5",
-    "socket.io": "^4.8.3",
     "xss-clean": "^0.1.4"
+  },
+  "engines": {
+    "node": "20.x"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"

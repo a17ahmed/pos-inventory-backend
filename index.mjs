@@ -13,14 +13,9 @@ import hpp from 'hpp';
 import xss from 'xss-clean';
 import rateLimit from 'express-rate-limit';
 import helmet from 'helmet';
-import { createServer } from 'http';
-import { Server } from 'socket.io';
 
 const app = express();
 const port = process.env.PORT || 3000;
-
-// Create HTTP server for Socket.io
-const server = createServer(app);
 
 import fs from 'fs';
 import path from 'path';
@@ -179,7 +174,15 @@ const jwtAuth = (req, res, next) => {
 const allowedOrigins = (process.env.CORS_ORIGINS || '*').split(',').map(o => o.trim());
 const corsOptions = {
     origin: process.env.NODE_ENV === 'production'
-        ? [...allowedOrigins, 'http://localhost:5177', 'http://localhost:3000']
+        ? (origin, callback) => {
+            // Allow requests with no origin (Electron, mobile apps, server-to-server)
+            if (!origin) return callback(null, true);
+            // Allow all if wildcard is configured
+            if (allowedOrigins.includes('*') || allowedOrigins.includes(origin)) {
+                return callback(null, true);
+            }
+            callback(new Error('Not allowed by CORS'));
+        }
         : true, // Allow all in development
     credentials: true,
     methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
@@ -274,77 +277,12 @@ app.use((err, req, res, next) => {
     res.status(500).json({ message: 'Internal server error' });
 });
 
-// Import Employee model for socket auth
-import Employee from './models/employee.mjs';
-
-// Initialize Socket.io with CORS
-const io = new Server(server, {
-    cors: {
-        origin: process.env.NODE_ENV === 'production'
-            ? allowedOrigins
-            : "*",
-        methods: ["GET", "POST", "PATCH", "PUT", "DELETE"]
-    }
-});
-
-// Socket authentication middleware
-io.use(async (socket, next) => {
-    const token = socket.handshake.auth.token;
-    if (!token) {
-        return next(new Error('Authentication required'));
-    }
-    try {
-        const decoded = jwt.verify(token, publicKey);
-        let role = 'employee'; // default role
-
-        if (decoded.id) {
-            const employee = await Employee.findById(decoded.id).select('role');
-            role = employee?.role || 'employee';
-        } else if (decoded.adminId) {
-            role = decoded.role || 'admin';
-        }
-
-        socket.user = {
-            id: decoded.id || decoded.adminId,
-            businessId: decoded.businessId,
-            role
-        };
-        next();
-    } catch (error) {
-        console.error('Socket auth error:', error.message);
-        next(new Error('Token verification failed'));
-    }
-});
-
-// Socket connection handling
-io.on('connection', (socket) => {
-    const { businessId, role } = socket.user;
-
-    console.log(`Socket connected: ${socket.id} | Business: ${businessId} | Role: ${role}`);
-
-    // Join business room (all employees of same business)
-    socket.join(`business:${businessId}`);
-
-    // Join role-specific room
-    if (role) {
-        socket.join(`business:${businessId}:${role}`);
-    }
-
-    // Handle manual role room join — only allow user's actual role
-    socket.on('join:role', ({ role: newRole }) => {
-        if (newRole && newRole === role) {
-            socket.join(`business:${businessId}:${newRole}`);
-        }
-    });
-
-    // Handle disconnection
-    socket.on('disconnect', () => {
-        console.log(`Socket disconnected: ${socket.id}`);
-    });
-});
-
-// Export io for use in controllers
-export { io };
+// Dummy Socket.IO object — silently absorbs all emit calls (no-op for Vercel serverless)
+export const io = {
+    emit: () => {},
+    to: () => ({ emit: () => {} }),
+    in: () => ({ emit: () => {} })
+};
 
 // Graceful error handling
 process.on('unhandledRejection', (reason, promise) => {
@@ -356,31 +294,23 @@ process.on('uncaughtException', (error) => {
     process.exit(1);
 });
 
-server.listen(port, '0.0.0.0', () => {
+app.listen(port, '0.0.0.0', () => {
     console.log(`Inventory Server is Running at 0.0.0.0:${port}`);
 });
 
 // Graceful shutdown
 const gracefulShutdown = async (signal) => {
     console.log(`\n${signal} received. Shutting down gracefully...`);
-
-    server.close(async () => {
-        console.log('HTTP server closed');
-        try {
-            await mongoose.connection.close();
-            console.log('Database connection closed');
-        } catch (err) {
-            console.error('Error closing database connection:', err);
-        }
-        process.exit(0);
-    });
-
-    // Force shutdown after 10 seconds
-    setTimeout(() => {
-        console.error('Forced shutdown after timeout');
-        process.exit(1);
-    }, 10000);
+    try {
+        await mongoose.connection.close();
+        console.log('Database connection closed');
+    } catch (err) {
+        console.error('Error closing database connection:', err);
+    }
+    process.exit(0);
 };
 
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+export default app;
