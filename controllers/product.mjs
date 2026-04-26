@@ -176,7 +176,8 @@ const getProduct = async (req, res) => {
     try {
         const product = await Product.findOne({
             _id: req.params.id,
-            business: req.user.businessId
+            business: req.user.businessId,
+            isActive: true
         });
 
         if (!product) {
