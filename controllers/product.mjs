@@ -59,14 +59,34 @@ const createProduct = async (req, res) => {
             barcode = await generateUniqueBarcode(req.user.businessId);
         }
 
-        const productData = new Product({
-            ...req.body,
-            sku,
-            barcode,
-            business: req.user.businessId
-        });
+        // Check if a soft-deleted product with same barcode or SKU exists — reactivate it
+        const reactivateFilter = {
+            business: req.user.businessId,
+            isActive: false,
+            $or: []
+        };
+        if (barcode) reactivateFilter.$or.push({ barcode });
+        if (sku) reactivateFilter.$or.push({ sku });
 
-        const savedProduct = await productData.save();
+        let savedProduct;
+
+        if (reactivateFilter.$or.length > 0) {
+            const existing = await Product.findOne(reactivateFilter);
+            if (existing) {
+                Object.assign(existing, req.body, { sku, barcode, isActive: true });
+                savedProduct = await existing.save();
+            }
+        }
+
+        if (!savedProduct) {
+            const productData = new Product({
+                ...req.body,
+                sku,
+                barcode,
+                business: req.user.businessId
+            });
+            savedProduct = await productData.save();
+        }
         res.status(201).json(savedProduct);
     } catch (error) {
         console.error('Error creating product:', error);
@@ -92,9 +112,11 @@ const getAllProducts = async (req, res) => {
             business: req.user.businessId
         };
 
-        // Filter by active status
-        if (active !== undefined) {
-            query.isActive = active === 'true';
+        // Filter by active status (default: only active products)
+        if (active === 'false') {
+            query.isActive = false;
+        } else {
+            query.isActive = true;
         }
 
         // Filter by category

@@ -342,8 +342,14 @@ const getVendorLedger = async (req, res) => {
             }
         }
 
-        // Sort by date
-        ledger.sort((a, b) => new Date(a.date) - new Date(b.date));
+        // Sort by date, with type priority for same-timestamp entries
+        // (debit/supply before credit/payment so running balance makes sense)
+        const typePriority = { opening_balance: 0, supply: 1, return: 2, payment: 3 };
+        ledger.sort((a, b) => {
+            const dateDiff = new Date(a.date) - new Date(b.date);
+            if (dateDiff !== 0) return dateDiff;
+            return (typePriority[a.type] || 0) - (typePriority[b.type] || 0);
+        });
 
         // Calculate running balance
         let runningBalance = 0;

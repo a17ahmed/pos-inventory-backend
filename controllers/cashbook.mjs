@@ -41,8 +41,30 @@ export const recordCashEntry = async ({
 }) => {
     const bizId = new mongoose.Types.ObjectId(businessId);
 
+    // Auto-create opening balance of 0 if this is the first entry and it's not an opening_balance
+    if (type !== 'opening_balance') {
+        const hasOpening = await CashBook.findOne({ business: bizId, type: 'opening_balance' })
+            .session(session)
+            .lean();
+        if (!hasOpening) {
+            const openingEntryNumber = await Counter.getNextSequence('cashbookEntry', businessId, session);
+            const openingEntry = new CashBook({
+                entryNumber: openingEntryNumber,
+                type: 'opening_balance',
+                amount: 0,
+                direction: 'in',
+                runningBalance: 0,
+                referenceType: 'manual',
+                description: 'Opening cash balance (auto)',
+                note: '',
+                performedBy: 'System',
+                business: bizId,
+            });
+            await openingEntry.save({ session });
+        }
+    }
+
     // Get current balance from latest entry
-    const findOpts = session ? { session } : {};
     const latest = await CashBook.findOne({ business: bizId })
         .sort({ createdAt: -1, entryNumber: -1 })
         .select('runningBalance')
@@ -169,8 +191,53 @@ export const getCashBook = async (req, res) => {
             CashBook.countDocuments(match),
         ]);
 
+        // Build daily summary with auto-carried opening/closing balances
+        const dailySummary = {};
+
+        if (entries.length > 0) {
+            // Get the closing balance from the day before the first entry on this page
+            const firstEntry = entries[0];
+            const firstDayStart = new Date(firstEntry.createdAt);
+            firstDayStart.setHours(0, 0, 0, 0);
+
+            const prevEntry = await CashBook.findOne({
+                business: businessId,
+                createdAt: { $lt: firstDayStart },
+            })
+                .sort({ createdAt: -1, entryNumber: -1 })
+                .select('runningBalance')
+                .lean();
+
+            let carryForwardBalance = prevEntry?.runningBalance ?? 0;
+
+            for (const entry of entries) {
+                const d = new Date(entry.createdAt);
+                const dayKey = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+                if (!dailySummary[dayKey]) {
+                    dailySummary[dayKey] = {
+                        date: dayKey,
+                        openingBalance: carryForwardBalance,
+                        closingBalance: entry.runningBalance,
+                        totalIn: 0,
+                        totalOut: 0,
+                        entryCount: 0,
+                    };
+                }
+
+                const day = dailySummary[dayKey];
+                day.closingBalance = entry.runningBalance;
+                day.entryCount++;
+                if (entry.direction === 'in') day.totalIn += entry.amount;
+                else day.totalOut += entry.amount;
+
+                carryForwardBalance = entry.runningBalance;
+            }
+        }
+
         res.json({
             entries,
+            dailySummary: Object.values(dailySummary),
             pagination: {
                 page: parseInt(page),
                 limit: parseInt(limit),

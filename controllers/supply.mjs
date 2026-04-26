@@ -120,7 +120,7 @@ const createSupply = async (req, res) => {
             payments.push({
                 amount: initialPaid,
                 method: supplyPayMethod,
-                paidAt: new Date(),
+                paidAt: billDate ? new Date(billDate) : new Date(),
                 paidBy: req.user.adminId ? 'Admin' : req.user.name || '',
                 note: 'Initial payment on supply creation',
                 reference: req.body.paymentReference || ''
