@@ -354,8 +354,22 @@ export const createBill = async (req, res) => {
             // ── Atomic bill number (inside transaction) ──────────────
             const billNumber = await Counter.getNextSequence("billNumber", req.user.businessId, session);
 
+            // ── Snapshot customer's balance right before this bill's credit
+            // portion is applied to their ledger (post-save hook below).
+            // Read inside the transaction so no concurrent write can land
+            // between this read and the bill save.
+            let customerBalanceBefore = 0;
+            if (req.body.customer) {
+                const liveCustomer = await Customer.findById(req.body.customer)
+                    .session(session)
+                    .select("balance")
+                    .lean();
+                customerBalanceBefore = liveCustomer?.balance || 0;
+            }
+
             const bill = new Bill({
                 billNumber,
+                customerBalanceBefore,
                 business: req.user.businessId,
                 status: billStatus,
                 type: "sale",

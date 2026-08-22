@@ -159,6 +159,11 @@ const billSchema = new Schema(
         customerName: { type: String, default: "Walk-in" },
         customerPhone: { type: String, default: "" },
 
+        // Customer's ledger balance immediately before this bill's credit portion
+        // was applied. Frozen at creation so historical receipts stay accurate
+        // even after the customer makes later payments. 0 for walk-in sales.
+        customerBalanceBefore: { type: Number, default: 0 },
+
         // Returns
         returns: [returnEntrySchema],
         totalRefunded: { type: Number, default: 0 },        // all refunds (all methods)
