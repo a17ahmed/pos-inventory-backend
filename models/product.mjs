@@ -33,6 +33,14 @@ const productSchema = new Schema(
             type: Number,
             default: 0
         },
+        // Cashier-facing discount ceiling for this product. null = no explicit
+        // cap, just enforce the cost-price floor at bill time.
+        maxDiscountPercent: {
+            type: Number,
+            min: 0,
+            max: 100,
+            default: null
+        },
         // Category
         category: {
             type: String,

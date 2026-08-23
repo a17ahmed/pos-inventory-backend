@@ -16,7 +16,8 @@ const accessSchema = new Schema(
             // POS / Sales
             pos: {
                 view: { type: Boolean, default: true },
-                create: { type: Boolean, default: true }
+                create: { type: Boolean, default: true },
+                viewProfit: { type: Boolean, default: false }
             },
             pendingBills: {
                 view: { type: Boolean, default: true },

@@ -7,8 +7,51 @@ import Expense from "../models/expense.mjs";
 import StockMovement from "../models/stockMovement.mjs";
 import { recordCashEntry } from "./cashbook.mjs";
 import { startOfToday, startOfMonth, startOfWeek, endOfDay as endOfDayHelper, startOfDay, toLocalDateString, toLocalTimeString, getTimezone } from "../utils/dateHelpers.mjs";
+import { canViewProfit } from "../middleware/accessControl.mjs";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
+
+const PROFIT_ITEM_FIELDS = ["costPrice", "itemProfit", "netProfit", "returnedProfit"];
+const PROFIT_BILL_FIELDS = ["totalCost", "billProfit", "netProfit", "returnedProfit"];
+const PROFIT_RETURN_FIELDS = ["profitLost"];
+
+/**
+ * Strip cost/profit fields from a bill (its items, and its returns) unless
+ * the requester has permission to see them. Accepts a Mongoose document or a
+ * lean object; always returns a plain object safe to send in a response.
+ */
+const redactProfitFields = (bill, canSeeProfit) => {
+    const plain = typeof bill.toObject === "function" ? bill.toObject() : { ...bill };
+
+    if (canSeeProfit) return plain;
+
+    for (const field of PROFIT_BILL_FIELDS) delete plain[field];
+
+    if (Array.isArray(plain.items)) {
+        plain.items = plain.items.map((item) => {
+            const copy = { ...item };
+            for (const field of PROFIT_ITEM_FIELDS) delete copy[field];
+            return copy;
+        });
+    }
+
+    if (Array.isArray(plain.returns)) {
+        plain.returns = plain.returns.map((entry) => {
+            const copy = { ...entry };
+            for (const field of PROFIT_RETURN_FIELDS) delete copy[field];
+            if (Array.isArray(copy.items)) {
+                copy.items = copy.items.map((item) => {
+                    const itemCopy = { ...item };
+                    for (const field of PROFIT_ITEM_FIELDS) delete itemCopy[field];
+                    return itemCopy;
+                });
+            }
+            return copy;
+        });
+    }
+
+    return plain;
+};
 
 /**
  * Batch-fetch costPrice for an array of items that have a product ObjectId.
@@ -23,26 +66,65 @@ const buildCostMap = async (items, businessId) => {
 
     const products = await Product.find(
         { _id: { $in: ids }, business: businessId },
-        { costPrice: 1 }
+        { costPrice: 1, maxDiscountPercent: 1 }
     ).lean();
 
     const map = new Map();
-    for (const p of products) map.set(p._id.toString(), p.costPrice || 0);
+    for (const p of products) {
+        map.set(p._id.toString(), {
+            costPrice: p.costPrice || 0,
+            maxDiscountPercent: p.maxDiscountPercent ?? null,
+        });
+    }
     return map;
 };
 
 /**
- * Enrich bill items with costPrice from the Product collection.
- * Mutates nothing -- returns a new array.
+ * Enrich bill items with costPrice and maxDiscountPercent from the Product
+ * collection. Mutates nothing -- returns a new array.
  */
 const enrichItemsWithCost = async (items, businessId) => {
     const costMap = await buildCostMap(items, businessId);
-    return items.map((item) => ({
-        ...item,
-        costPrice:
-            item.costPrice ??
-            (item.product ? costMap.get(item.product.toString()) || 0 : 0),
-    }));
+    return items.map((item) => {
+        const info = item.product ? costMap.get(item.product.toString()) : null;
+        return {
+            ...item,
+            costPrice: item.costPrice ?? (info?.costPrice ?? 0),
+            maxDiscountPercent: info?.maxDiscountPercent ?? null,
+        };
+    });
+};
+
+/**
+ * Validate every line item's discountAmount against its product's cost-price
+ * floor and optional maxDiscountPercent cap. Returns { error, capTotal } --
+ * error is a user-facing message (or null if all items pass), capTotal is
+ * the sum of each item's individually allowed cap (used for the whole-bill
+ * discount check).
+ */
+const validateDiscountLimits = (enrichedItems) => {
+    let capTotal = 0;
+
+    for (const item of enrichedItems) {
+        const qty = item.qty || 1;
+        const lineGross = (item.price || 0) * qty;
+        const discountAmount = item.discountAmount || 0;
+        const costPrice = item.costPrice || 0;
+
+        const hardFloorCap = lineGross - costPrice * qty;
+        const percentCap = item.maxDiscountPercent != null
+            ? (lineGross * item.maxDiscountPercent) / 100
+            : Infinity;
+
+        const effectiveCap = Math.max(0, Math.min(hardFloorCap, percentCap));
+        capTotal += effectiveCap;
+
+        if (discountAmount > effectiveCap + 0.01) {
+            return { error: `Discount on ${item.name} exceeds the allowed limit`, capTotal };
+        }
+    }
+
+    return { error: null, capTotal };
 };
 
 /**
@@ -235,6 +317,20 @@ export const createBill = async (req, res) => {
             return res.status(400).json({
                 message: "Cannot apply both item-level and bill-level discounts on the same bill. Choose one.",
             });
+        }
+
+        // ── Discount cap validation: cost-price floor + optional per-product max% ──
+        const { error: discountCapError, capTotal: allowedDiscountCapTotal } = validateDiscountLimits(enrichedItems);
+        if (discountCapError) {
+            return res.status(400).json({ message: discountCapError });
+        }
+        if (hasBillDiscount) {
+            const billDiscountAmount = parseFloat(req.body.billDiscountAmount) || 0;
+            if (billDiscountAmount > allowedDiscountCapTotal + 0.01) {
+                return res.status(400).json({
+                    message: "Bill discount exceeds the allowed limit",
+                });
+            }
         }
 
         // ── Build discount history entry ─────────────────────────
@@ -455,7 +551,8 @@ export const createBill = async (req, res) => {
             }
 
             await session.commitTransaction();
-            res.status(201).json(saved);
+            const canSeeProfit = await canViewProfit(req);
+            res.status(201).json(redactProfitFields(saved, canSeeProfit));
         } catch (txError) {
             await session.abortTransaction();
             throw txError;
@@ -533,8 +630,11 @@ export const getAllBills = async (req, res) => {
 
         const totalPages = fetchAll ? 1 : Math.ceil(total / limit);
 
+        const canSeeProfit = await canViewProfit(req);
+        const redactedBills = bills.map((bill) => redactProfitFields(bill, canSeeProfit));
+
         res.json({
-            bills,
+            bills: redactedBills,
             pagination: {
                 page: fetchAll ? 1 : page,
                 perPage: fetchAll ? total : limit,
@@ -561,7 +661,8 @@ export const getBill = async (req, res) => {
 
         if (!bill) return res.status(404).json({ message: "Bill not found" });
 
-        res.json(bill);
+        const canSeeProfit = await canViewProfit(req);
+        res.json(redactProfitFields(bill, canSeeProfit));
     } catch (error) {
         console.error("Error fetching bill:", error);
         res.status(500).json({ message: "Failed to fetch bill" });
@@ -1120,11 +1221,12 @@ export const processReturn = async (req, res) => {
             session.endSession();
         }
 
+        const canSeeProfit = await canViewProfit(req);
         res.json({
             message: "Return processed successfully",
             returnNumber,
             refundAmount: totalRefundAmount,
-            bill: saved,
+            bill: redactProfitFields(saved, canSeeProfit),
         });
     } catch (error) {
         console.error("Error processing return:", error);
@@ -1163,7 +1265,8 @@ export const getReturns = async (req, res) => {
             .sort({ createdAt: -1 })
             .lean();
 
-        res.json(bills);
+        const canSeeProfit = await canViewProfit(req);
+        res.json(bills.map((bill) => redactProfitFields(bill, canSeeProfit)));
     } catch (error) {
         console.error("Error fetching returns:", error);
         res.status(500).json({ message: "Failed to fetch returns" });
@@ -1201,18 +1304,21 @@ export const getBillForReturn = async (req, res) => {
             return res.status(400).json({ message: "Cannot process return on a cancelled bill" });
         }
 
-        const itemsWithReturns = bill.items.map((item) => ({
-            ...item.toObject(),
+        const canSeeProfit = await canViewProfit(req);
+        const redactedBill = redactProfitFields(bill, canSeeProfit);
+
+        const itemsWithReturns = redactedBill.items.map((item) => ({
+            ...item,
             originalQty: item.qty,
             returnedQty: item.returnedQty || 0,
             remainingQty: item.qty - (item.returnedQty || 0),
         }));
 
         res.json({
-            ...bill.toObject(),
+            ...redactedBill,
             items: itemsWithReturns,
             hasReturns: bill.returns && bill.returns.length > 0,
-            returnHistory: bill.returns || [],
+            returnHistory: redactedBill.returns || [],
         });
     } catch (error) {
         console.error("Error looking up bill for return:", error);
@@ -1348,7 +1454,8 @@ export const cancelReturn = async (req, res) => {
             session.endSession();
         }
 
-        res.json({ message: "Return cancelled successfully", bill: saved });
+        const canSeeProfit = await canViewProfit(req);
+        res.json({ message: "Return cancelled successfully", bill: redactProfitFields(saved, canSeeProfit) });
     } catch (error) {
         console.error("Error cancelling return:", error);
         res.status(500).json({ message: "Failed to cancel return" });
@@ -1562,9 +1669,10 @@ export const createStandaloneRefund = async (req, res) => {
             session.endSession();
         }
 
+        const canSeeProfit = await canViewProfit(req);
         res.json({
             message: "Standalone refund processed",
-            refundBill: savedRefund,
+            refundBill: redactProfitFields(savedRefund, canSeeProfit),
         });
     } catch (error) {
         console.error("Error processing standalone refund:", error);

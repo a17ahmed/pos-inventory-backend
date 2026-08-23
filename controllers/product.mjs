@@ -38,6 +38,20 @@ const generateUniqueBarcode = async (businessId) => {
     throw new Error('Could not generate a unique barcode after 10 attempts');
 };
 
+/**
+ * Reject a maxDiscountPercent that would let a cashier discount the item
+ * below its cost price. Returns an error message, or null if valid.
+ */
+const validateMaxDiscountPercent = (maxDiscountPercent, sellingPrice, costPrice) => {
+    if (maxDiscountPercent === undefined || maxDiscountPercent === null) return null;
+
+    const minAllowedPrice = sellingPrice * (1 - maxDiscountPercent / 100);
+    if (minAllowedPrice < costPrice) {
+        return `Max discount of ${maxDiscountPercent}% on selling price Rs ${sellingPrice} would drop below cost price Rs ${costPrice}`;
+    }
+    return null;
+};
+
 // Create a new product
 const createProduct = async (req, res) => {
     try {
@@ -45,6 +59,15 @@ const createProduct = async (req, res) => {
             return res.status(400).json({
                 message: 'Business ID not found. Please log out and log in again.'
             });
+        }
+
+        if (req.body.maxDiscountPercent !== undefined && req.body.maxDiscountPercent !== null) {
+            const errMsg = validateMaxDiscountPercent(
+                req.body.maxDiscountPercent,
+                req.body.sellingPrice,
+                req.body.costPrice || 0
+            );
+            if (errMsg) return res.status(400).json({ message: errMsg });
         }
 
         // Auto-generate SKU if blank (always — SKU is required for lookup)
@@ -197,7 +220,7 @@ const updateProduct = async (req, res) => {
         // Only allow updating these fields
         const allowedFields = [
             'name', 'description', 'barcode', 'sku',
-            'costPrice', 'sellingPrice', 'gst', 'category',
+            'costPrice', 'sellingPrice', 'gst', 'maxDiscountPercent', 'category',
             'stockQuantity', 'lowStockAlert', 'unit', 'trackStock'
         ];
 
@@ -210,6 +233,23 @@ const updateProduct = async (req, res) => {
 
         if (Object.keys(updates).length === 0) {
             return res.status(400).json({ message: 'No valid fields to update' });
+        }
+
+        if (updates.maxDiscountPercent !== undefined && updates.maxDiscountPercent !== null) {
+            const current = await Product.findOne(
+                { _id: req.params.id, business: req.user.businessId },
+                { sellingPrice: 1, costPrice: 1 }
+            ).lean();
+
+            if (!current) {
+                return res.status(404).json({ message: 'Product not found' });
+            }
+
+            const sellingPrice = updates.sellingPrice ?? current.sellingPrice;
+            const costPrice = updates.costPrice ?? current.costPrice ?? 0;
+
+            const errMsg = validateMaxDiscountPercent(updates.maxDiscountPercent, sellingPrice, costPrice);
+            if (errMsg) return res.status(400).json({ message: errMsg });
         }
 
         const product = await Product.findOneAndUpdate(

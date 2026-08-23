@@ -35,6 +35,20 @@ export const invalidateAccessCache = (employeeId, businessId) => {
 };
 
 /**
+ * Whether the requesting user can see profit/cost figures.
+ * Admins always can; employees need permissions.pos.viewProfit === true.
+ */
+export const canViewProfit = async (req) => {
+    if (req.user?.adminId) return true;
+
+    const employeeId = req.user?.id || req.user?.employeeId;
+    if (!employeeId) return false;
+
+    const permissions = await getAccessForEmployee(employeeId, req.user.businessId);
+    return permissions?.pos?.viewProfit === true;
+};
+
+/**
  * Invalidate all cached access entries for a business.
  */
 export const invalidateBusinessAccessCache = (businessId) => {
