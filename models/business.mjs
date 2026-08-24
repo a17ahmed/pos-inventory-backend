@@ -76,6 +76,14 @@ const businessSchema = new Schema(
             type: String,
             default: ""
         },
+        showCustomerPhone: {
+            type: Boolean,
+            default: true
+        },
+        showCustomerAddress: {
+            type: Boolean,
+            default: true
+        },
         settings: {
             language: { type: String, default: "en" },
             timezone: { type: String, default: "Asia/Karachi" },

@@ -97,6 +97,8 @@ export const updateBusinessSchema = Joi.object({
     settings: Joi.object(),
     receiptFooter: Joi.string().max(60).allow(""),
     receiptNote: Joi.string().max(60).allow(""),
+    showCustomerPhone: Joi.boolean(),
+    showCustomerAddress: Joi.boolean(),
 });
 
 // ═══════════════════════════════════════════════════════════════
@@ -428,6 +430,7 @@ export const createBillSchema = Joi.object({
     customer: objectId.allow(null),
     customerName: Joi.string().allow(""),
     customerPhone: Joi.string().allow(""),
+    customerAddress: Joi.string().allow(""),
     cashGiven: Joi.number().min(0),
     amountPaid: Joi.number().min(0),
     paymentMethod: Joi.string().valid("cash", "card", "online", "store_credit"),
@@ -445,6 +448,7 @@ export const holdBillSchema = Joi.object({
     customer: objectId.allow(null),
     customerName: Joi.string().allow(""),
     customerPhone: Joi.string().allow(""),
+    customerAddress: Joi.string().allow(""),
     amountPaid: Joi.number().min(0),
     paymentMethod: Joi.string().valid("cash", "card", "online", "store_credit"),
     billDiscountAmount: Joi.number().min(0),
@@ -507,6 +511,7 @@ export const addPaymentSchema = Joi.object({
 export const updateBillSchema = Joi.object({
     customerName: Joi.string().allow(""),
     customerPhone: Joi.string().allow(""),
+    customerAddress: Joi.string().allow(""),
     cashGiven: Joi.number().min(0),
     notes: Joi.string().allow(""),
     billName: Joi.string().allow(""),

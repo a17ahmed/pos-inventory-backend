@@ -480,6 +480,7 @@ export const createBill = async (req, res) => {
                 customer: req.body.customer || null,
                 customerName: customerDoc?.name || req.body.customerName || "Walk-in",
                 customerPhone: customerDoc?.phone || req.body.customerPhone || "",
+                customerAddress: customerDoc?.address || req.body.customerAddress || "",
 
                 // Bill-level discount
                 billDiscountAmount: parseFloat(req.body.billDiscountAmount) || 0,
@@ -686,6 +687,7 @@ export const updateBill = async (req, res) => {
         const safe = [
             "customerName",
             "customerPhone",
+            "customerAddress",
             "cashGiven",
             "notes",
             "billName",
@@ -869,6 +871,7 @@ export const holdBill = async (req, res) => {
                 customer: req.body.customer || null,
                 customerName: req.body.customerName || "Walk-in",
                 customerPhone: req.body.customerPhone || "",
+                customerAddress: req.body.customerAddress || "",
                 billDiscountAmount: parseFloat(req.body.billDiscountAmount) || 0,
                 billDiscountReason: req.body.billDiscountReason || "",
                 discountHistory,

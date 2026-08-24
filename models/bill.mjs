@@ -158,6 +158,7 @@ const billSchema = new Schema(
         customer: { type: Schema.Types.ObjectId, ref: "Customer", default: null },
         customerName: { type: String, default: "Walk-in" },
         customerPhone: { type: String, default: "" },
+        customerAddress: { type: String, default: "" },
 
         // Customer's ledger balance immediately before this bill's credit portion
         // was applied. Frozen at creation so historical receipts stay accurate

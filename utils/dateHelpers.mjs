@@ -24,39 +24,42 @@ export const startOfWeek = (date = new Date()) => {
 };
 
 /**
- * End of day for a date string — sets to 23:59:59.999 local time.
- * Handles both ISO strings ("2026-04-17T00:00:00.000Z") and
- * plain date strings ("2026-04-17") safely.
+ * End of day for a plain date string — sets to 23:59:59.999 local time.
+ * Plain date strings ("YYYY-MM-DD") are parsed as UTC by JS spec, so they're
+ * split and reconstructed to ensure local timezone interpretation.
+ *
+ * Full datetime strings (anything with a "T" time component, e.g.
+ * "2026-04-17T14:30:00" or "2026-04-17T14:30:00.000Z") are passed straight
+ * to `new Date()` and returned as-is — the exact time is respected rather
+ * than being overridden to end-of-day. Per the JS Date spec, ISO datetime
+ * strings with no timezone offset are parsed as local time (matching
+ * process.env.TZ set at startup), so a frontend sending its local
+ * wall-clock time with no "Z" suffix lines up correctly here.
  */
 export const endOfDay = (dateStr) => {
-    // Plain date strings ("YYYY-MM-DD") are parsed as UTC by JS spec.
-    // Split and reconstruct to ensure local timezone interpretation.
     const str = String(dateStr);
-    let d;
     if (/^\d{4}-\d{2}-\d{2}$/.test(str)) {
         const [y, m, day] = str.split('-').map(Number);
-        d = new Date(y, m - 1, day);
-    } else {
-        d = new Date(str);
+        const d = new Date(y, m - 1, day);
+        d.setHours(23, 59, 59, 999);
+        return d;
     }
-    d.setHours(23, 59, 59, 999);
-    return d;
+    return new Date(str);
 };
 
 /**
- * Start of day for a date string — sets to 00:00:00.000 local time.
+ * Start of day for a plain date string — sets to 00:00:00.000 local time.
+ * See endOfDay() above for the full-datetime-string behavior.
  */
 export const startOfDay = (dateStr) => {
     const str = String(dateStr);
-    let d;
     if (/^\d{4}-\d{2}-\d{2}$/.test(str)) {
         const [y, m, day] = str.split('-').map(Number);
-        d = new Date(y, m - 1, day);
-    } else {
-        d = new Date(str);
+        const d = new Date(y, m - 1, day);
+        d.setHours(0, 0, 0, 0);
+        return d;
     }
-    d.setHours(0, 0, 0, 0);
-    return d;
+    return new Date(str);
 };
 
 /** Format a Date as "YYYY-MM-DD" in local timezone */
