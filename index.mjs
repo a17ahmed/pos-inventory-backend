@@ -49,6 +49,7 @@ import vendorRouter from './routes/vendor.mjs';
 import supplyRouter from './routes/supply.mjs';
 import accessRouter from './routes/access.mjs';
 import cashbookRouter from './routes/cashbook.mjs';
+import closingRouter from './routes/closing.mjs';
 
 // Shared auth routes (refresh token, logout)
 import authRouter from './routes/auth.mjs';
@@ -264,6 +265,7 @@ app.use("/expense", jwtAuth, accessControl, expenseRouter);
 app.use("/vendor", jwtAuth, accessControl, vendorRouter);
 app.use("/supply", jwtAuth, accessControl, supplyRouter);
 app.use("/cashbook", jwtAuth, accessControl, cashbookRouter);
+app.use("/closing", jwtAuth, accessControl, closingRouter);
 
 // Access control management (admin only, no accessControl middleware needed - uses RBAC)
 app.use("/access", jwtAuth, accessRouter);

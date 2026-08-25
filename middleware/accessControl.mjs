@@ -138,6 +138,11 @@ const ROUTE_PERMISSIONS = {
         POST:  { _default: { module: 'cashbook', action: 'manage' } },
     },
 
+    '/closing': {
+        GET:  { _default: { module: 'closing', action: 'view' } },
+        POST: { _default: { module: 'closing', action: 'create' } },
+    },
+
     '/bill': {
         GET: {
             _default:    { module: 'pos', action: 'view' },

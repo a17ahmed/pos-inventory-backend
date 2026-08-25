@@ -99,6 +99,10 @@ const businessSchema = new Schema(
         isActive: {
             type: Boolean,
             default: true
+        },
+        lastClosingAt: {
+            type: Date,
+            default: null
         }
     },
     { timestamps: true }

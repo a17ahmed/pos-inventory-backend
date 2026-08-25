@@ -208,6 +208,7 @@ export const updateAccessSchema = Joi.object({
         customers: permissionFields,
         employees: permissionFields,
         cashbook: permissionFields,
+        closing: permissionFields,
         dashboard: permissionFields,
         reports: permissionFields,
         settings: permissionFields,
@@ -561,4 +562,17 @@ export const cashbookTransactionSchema = Joi.object({
     amount: Joi.number().positive().required(),
     note: Joi.string().allow('').optional(),
     description: Joi.string().allow('').optional(),
+});
+
+// ═══════════════════════════════════════════════════════════════
+// STORE CLOSING
+// ═══════════════════════════════════════════════════════════════
+
+export const createClosingSchema = Joi.object({
+    periodStart: Joi.date().iso().required(),
+    periodEnd: Joi.date().iso().required(),
+    countedNote: Joi.string().allow('').optional(),
+    countedCash: Joi.number().min(0).optional(),
+    countedCard: Joi.number().min(0).optional(),
+    countedOnline: Joi.number().min(0).optional(),
 });

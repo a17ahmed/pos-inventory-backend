@@ -88,6 +88,12 @@ const accessSchema = new Schema(
                 manage: { type: Boolean, default: false }
             },
 
+            // Store Closing (period reconciliation snapshots)
+            closing: {
+                view: { type: Boolean, default: false },
+                create: { type: Boolean, default: false }
+            },
+
             // Reports / Analytics
             dashboard: {
                 view: { type: Boolean, default: true }
