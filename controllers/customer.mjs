@@ -300,8 +300,24 @@ export const getCustomerLedger = async (req, res) => {
 
             // Return entries (credit — we refunded the customer)
             if (bill.returns && bill.returns.length > 0) {
-                for (const ret of bill.returns) {
-                    // Summarise per-item reasons (returnEntry has no top-level reason)
+                // Track how much outstanding debt remains as we process each return
+                // chronologically. This lets us split each return into:
+                //   debtWriteOff — portion of outstanding debt cancelled (no cash/credit moves)
+                //   storeCredit  — portion the customer actually earns back
+                // The full refundAmount is still used as the ledger `credit` so the
+                // running balance remains correct.
+                let remainingOutstanding = Math.max(0, (bill.total || 0) - (bill.amountPaid || 0));
+
+                const sortedReturns = [...bill.returns].sort(
+                    (a, b) => new Date(a.returnedAt || 0) - new Date(b.returnedAt || 0)
+                );
+
+                for (const ret of sortedReturns) {
+                    const refund = ret.refundAmount || 0;
+                    const debtWriteOff = Math.min(remainingOutstanding, refund);
+                    const storeCredit = Math.max(0, refund - debtWriteOff);
+                    remainingOutstanding = Math.max(0, remainingOutstanding - debtWriteOff);
+
                     const reasons = (ret.items || [])
                         .map(i => i.reasonNote || i.reason || '')
                         .filter(Boolean);
@@ -315,7 +331,9 @@ export const getCustomerLedger = async (req, res) => {
                         billNumber: bill.billNumber,
                         returnItems: ret.items,
                         debit: 0,
-                        credit: ret.refundAmount || 0,
+                        credit: refund,        // full item value — drives the running balance
+                        storeCredit,           // actual credit customer earns back
+                        debtWriteOff,          // outstanding debt that is cancelled
                         notes: uniqueReasons.join(', ')
                     });
                 }

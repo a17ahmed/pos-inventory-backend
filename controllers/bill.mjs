@@ -1086,6 +1086,8 @@ export const processReturn = async (req, res) => {
         let saved;
         let returnNumber;
         let totalRefundAmount = 0;
+        let cashRefundAmount = 0;
+        let debtCancelled = 0;
         let refundMethod;
 
         try {
@@ -1168,6 +1170,22 @@ export const processReturn = async (req, res) => {
                 billItem.returnedQty += returnItem.quantity;
             }
 
+            // For partially-paid bills: only return what was actually received.
+            // paidRatio is the fraction of the bill total that has been paid.
+            // - ledger_adjust (customer bills): the formula amountDue = effectiveTotal - amountPaid
+            //   already produces the correct store-credit balance; no cash leaves so paidRatio
+            //   is irrelevant here and debtCancelled stays 0.
+            // - cash (walk-in bills): we can only hand back what was physically received.
+            //   The unpaid portion (debtCancelled) is tracked separately and folded into
+            //   totalLedgerRefunded so amountDue correctly reaches 0 after a full return.
+            cashRefundAmount = totalRefundAmount; // default: fully-paid bill, hand back full amount
+            if (refundMethod === 'cash') {
+                const billTotal = bill.total || 0;
+                const paidRatio = billTotal > 0 ? Math.min(1, (bill.amountPaid || 0) / billTotal) : 0;
+                cashRefundAmount = Math.round(totalRefundAmount * paidRatio * 100) / 100;
+                debtCancelled = Math.round((totalRefundAmount - cashRefundAmount) * 100) / 100;
+            }
+
             // Restore stock for returned items
             const stockItems = items
                 .map((ri) => {
@@ -1185,6 +1203,7 @@ export const processReturn = async (req, res) => {
                 items: returnItems,
                 refundMethod,
                 refundAmount: totalRefundAmount,
+                debtCancelled,
                 profitLost: totalProfitLost,
                 processedBy: req.user.id,
                 processedByName: req.user.name || "Staff",
@@ -1199,11 +1218,12 @@ export const processReturn = async (req, res) => {
                 performedBy: req.user.name || 'Staff'
             }, session);
 
-            // Record cash refund in cashbook (only for cash refunds, not ledger adjustments)
-            if (refundMethod === 'cash' && totalRefundAmount > 0) {
+            // Record cash refund in cashbook using only the amount actually received from the
+            // customer. On partially-paid bills this is less than the full item value.
+            if (refundMethod === 'cash' && cashRefundAmount > 0) {
                 await recordCashEntry({
                     type: 'customer_refund',
-                    amount: totalRefundAmount,
+                    amount: cashRefundAmount,
                     direction: 'out',
                     referenceType: 'bill',
                     referenceId: bill._id,
@@ -1228,7 +1248,9 @@ export const processReturn = async (req, res) => {
         res.json({
             message: "Return processed successfully",
             returnNumber,
-            refundAmount: totalRefundAmount,
+            refundAmount: totalRefundAmount,   // full value of returned items (for ledger/reporting)
+            cashRefundAmount,                   // actual cash handed back to customer
+            debtCancelled,                      // unpaid portion written off (0 for fully-paid bills)
             bill: redactProfitFields(saved, canSeeProfit),
         });
     } catch (error) {

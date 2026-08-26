@@ -27,6 +27,11 @@ const returnEntrySchema = new Schema({
         default: "cash"
     },
     refundAmount: { type: Number, default: 0 },
+    // Portion of refundAmount that was never paid by the customer and is written off as bad debt.
+    // Only non-zero on cash/card refunds when the original bill was partially paid.
+    // Formula: refundAmount - actualCashGivenBack
+    // This amount is included in totalLedgerRefunded so amountDue correctly zeroes out.
+    debtCancelled: { type: Number, default: 0 },
     profitLost: { type: Number, default: 0 },
     processedBy: { type: Schema.Types.ObjectId, ref: "Employee", default: null },
     processedByName: { type: String, default: "" },
@@ -334,10 +339,12 @@ billSchema.pre("save", function (next) {
 
     // ── Returns ────────────────────────────────────────────────
     this.totalRefunded = this.returns.reduce((sum, r) => sum + r.refundAmount, 0);
-    // Ledger adjustments reduce what the customer owes (no cash moves)
+    // Ledger adjustments + written-off debt both reduce effectiveTotal / amountDue without
+    // moving cash. debtCancelled is non-zero only on cash returns for partially-paid bills.
     this.totalLedgerRefunded = this.returns
         .filter((r) => r.refundMethod === "ledger_adjust")
-        .reduce((sum, r) => sum + r.refundAmount, 0);
+        .reduce((sum, r) => sum + r.refundAmount, 0)
+        + this.returns.reduce((sum, r) => sum + (r.debtCancelled || 0), 0);
     this.netAmount = this.total - this.totalRefunded;
 
     // ── Payments ───────────────────────────────────────────────
