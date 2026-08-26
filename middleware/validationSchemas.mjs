@@ -95,8 +95,8 @@ export const updateBusinessSchema = Joi.object({
     cashTaxRate: Joi.number().min(0).max(100),
     cardTaxRate: Joi.number().min(0).max(100),
     settings: Joi.object(),
-    receiptFooter: Joi.string().max(60).allow(""),
-    receiptNote: Joi.string().max(60).allow(""),
+    receiptFooter: Joi.string().max(110).allow(""),
+    receiptNote: Joi.string().max(110).allow(""),
     showCustomerPhone: Joi.boolean(),
     showCustomerAddress: Joi.boolean(),
 });

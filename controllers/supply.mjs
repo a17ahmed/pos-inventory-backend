@@ -834,6 +834,47 @@ const processSupplyReturn = async (req, res) => {
             await supply.save({ session });
 
             if (stockOps.length > 0) {
+                // Guard: the return quantity above was validated against what this
+                // supply originally shipped, not against what's actually left in
+                // stock right now (some of it may have already been sold). Check
+                // live stockQuantity inside the transaction before reversing it.
+                // Sum requested return quantity per product first — multiple
+                // return lines for the same product must be checked against
+                // their combined total, not each independently against the same
+                // unmutated stock snapshot.
+                const requestedByProduct = new Map();
+                for (const i of returnStockItems) {
+                    const key = i.product.toString();
+                    requestedByProduct.set(key, (requestedByProduct.get(key) || 0) + i.quantity);
+                }
+
+                const currentProducts = await Product.find(
+                    { _id: { $in: [...requestedByProduct.keys()] }, business: req.user.businessId, trackStock: true },
+                    { name: 1, stockQuantity: 1 }
+                ).session(session).lean();
+                const currentStockMap = new Map(currentProducts.map(p => [p._id.toString(), p]));
+
+                const outOfStock = [];
+                for (const [productId, requested] of requestedByProduct) {
+                    const prod = currentStockMap.get(productId);
+                    if (prod && prod.stockQuantity < requested) {
+                        outOfStock.push({
+                            productId,
+                            name: prod.name,
+                            requested,
+                            available: prod.stockQuantity
+                        });
+                    }
+                }
+
+                if (outOfStock.length > 0) {
+                    await session.abortTransaction();
+                    return res.status(400).json({
+                        message: 'Cannot return more than is currently in stock for some items',
+                        outOfStock
+                    });
+                }
+
                 await Product.bulkWrite(stockOps, { session });
                 const retProducts = await Product.find(
                     { _id: { $in: returnStockItems.map(i => i.product) }, business: req.user.businessId },

@@ -88,6 +88,12 @@ productSchema.index(
 productSchema.index({ sku: 1, business: 1 }, { unique: true, sparse: true });
 // Index for quick name search
 productSchema.index({ name: 'text', description: 'text' });
+// Main POS product-listing query: {business, isActive} sorted by name
+productSchema.index({ business: 1, isActive: 1, name: 1 });
+// Category-filtered browse
+productSchema.index({ business: 1, isActive: 1, category: 1 });
+// Low-stock / dashboard lookups
+productSchema.index({ business: 1, isActive: 1, trackStock: 1 });
 
 const Product = mongoose.model('Product', productSchema);
 

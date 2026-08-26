@@ -153,17 +153,36 @@ const getAllProducts = async (req, res) => {
             query.trackStock = true;
         }
 
-        // Search filter in MongoDB (not JavaScript)
+        let products;
         if (search) {
-            const searchRegex = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-            query.$or = [
-                { name: searchRegex },
-                { barcode: searchRegex },
-                { sku: searchRegex }
-            ];
-        }
+            // $text can't be combined with $or, so name/description search (via the
+            // text index) and barcode/sku prefix search (via their unique indexes)
+            // run as separate indexed queries and get merged here.
+            const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const prefixRegex = new RegExp('^' + escaped, 'i');
 
-        let products = await Product.find(query).sort({ name: 1 });
+            // $text interprets raw input as query syntax (leading "-" negates a
+            // term, quotes mark an exact phrase), so strip that before using it —
+            // otherwise e.g. searching "-15L" silently returns almost everything.
+            const textSafeSearch = search.replace(/"/g, '').replace(/(^|\s)-+/g, '$1').trim();
+
+            const queries = [
+                Product.find({
+                    ...query,
+                    $or: [{ barcode: prefixRegex }, { sku: prefixRegex }]
+                })
+            ];
+            if (textSafeSearch) {
+                queries.push(Product.find({ ...query, $text: { $search: textSafeSearch } }));
+            }
+
+            const results = await Promise.all(queries);
+            const byId = new Map();
+            for (const p of results.flat()) byId.set(p._id.toString(), p);
+            products = [...byId.values()].sort((a, b) => a.name.localeCompare(b.name));
+        } else {
+            products = await Product.find(query).sort({ name: 1 });
+        }
 
         res.json(products);
     } catch (error) {
@@ -301,34 +320,46 @@ const updateStock = async (req, res) => {
         const { quantity, operation } = req.body; // operation: 'add', 'subtract', 'set'
 
         const filter = { _id: req.params.id, business: req.user.businessId };
-        let update;
 
-        switch (operation) {
-            case 'add':
-                update = { $inc: { stockQuantity: quantity } };
-                break;
-            case 'subtract':
-                update = { $inc: { stockQuantity: -quantity } };
-                break;
-            case 'set':
-                update = { $set: { stockQuantity: quantity } };
-                break;
-            default:
-                return res.status(400).json({ message: 'Invalid operation' });
+        if (operation === 'set') {
+            if (quantity < 0) {
+                return res.status(400).json({ message: 'Stock quantity cannot be negative' });
+            }
+            const product = await Product.findOneAndUpdate(filter, { $set: { stockQuantity: quantity } }, { new: true });
+            if (!product) {
+                return res.status(404).json({ message: 'Product not found' });
+            }
+            return res.json(product);
         }
 
-        const product = await Product.findOneAndUpdate(filter, update, { new: true });
+        let delta;
+        if (operation === 'add') delta = quantity;
+        else if (operation === 'subtract') delta = -quantity;
+        else return res.status(400).json({ message: 'Invalid operation' });
 
+        if (delta < 0) {
+            // Only apply the decrement if enough stock is available, atomically —
+            // a plain $inc here (with the negative-check done after the write)
+            // would let concurrent requests race stock below zero.
+            const product = await Product.findOneAndUpdate(
+                { ...filter, stockQuantity: { $gte: -delta } },
+                { $inc: { stockQuantity: delta } },
+                { new: true }
+            );
+
+            if (!product) {
+                const exists = await Product.exists(filter);
+                if (!exists) return res.status(404).json({ message: 'Product not found' });
+                return res.status(400).json({ message: 'Insufficient stock for this operation' });
+            }
+
+            return res.json(product);
+        }
+
+        const product = await Product.findOneAndUpdate(filter, { $inc: { stockQuantity: delta } }, { new: true });
         if (!product) {
             return res.status(404).json({ message: 'Product not found' });
         }
-
-        // Ensure stock doesn't go negative
-        if (product.stockQuantity < 0) {
-            product.stockQuantity = 0;
-            await product.save();
-        }
-
         res.json(product);
     } catch (error) {
         console.error('[Product]', error.message);
@@ -341,20 +372,61 @@ const bulkUpdateStock = async (req, res) => {
     try {
         const { items } = req.body; // Array of { productId, quantity }
 
-        const ops = items.map(item => ({
-            updateOne: {
-                filter: { _id: item.productId, business: req.user.businessId, trackStock: true },
-                update: { $inc: { stockQuantity: -item.quantity } }
-            }
-        }));
-
         const session = await mongoose.startSession();
         try {
             session.startTransaction();
+
+            // Guard: verify sufficient stock for every deduction inside the
+            // transaction (read + write share a snapshot, so a concurrent
+            // request racing for the same stock gets a write conflict instead
+            // of both succeeding and driving stock negative).
+            // Sum requested quantity per product first — multiple line items for
+            // the same product must be checked against their combined total, not
+            // each independently against the same unmutated stock snapshot.
+            const requestedByProduct = new Map();
+            for (const item of items) {
+                if (item.quantity <= 0) continue;
+                const key = item.productId.toString();
+                requestedByProduct.set(key, (requestedByProduct.get(key) || 0) + item.quantity);
+            }
+
+            if (requestedByProduct.size > 0) {
+                const products = await Product.find(
+                    { _id: { $in: [...requestedByProduct.keys()] }, business: req.user.businessId, trackStock: true },
+                    { name: 1, stockQuantity: 1 }
+                ).session(session).lean();
+
+                const stockMap = new Map(products.map(p => [p._id.toString(), p]));
+                const outOfStock = [];
+                for (const [productId, requested] of requestedByProduct) {
+                    const prod = stockMap.get(productId);
+                    if (prod && prod.stockQuantity < requested) {
+                        outOfStock.push({
+                            productId,
+                            name: prod.name,
+                            requested,
+                            available: prod.stockQuantity
+                        });
+                    }
+                }
+
+                if (outOfStock.length > 0) {
+                    await session.abortTransaction();
+                    return res.status(400).json({ message: 'Insufficient stock for some items', outOfStock });
+                }
+            }
+
+            const ops = items.map(item => ({
+                updateOne: {
+                    filter: { _id: item.productId, business: req.user.businessId, trackStock: true },
+                    update: { $inc: { stockQuantity: -item.quantity } }
+                }
+            }));
+
             await Product.bulkWrite(ops, { session });
             await session.commitTransaction();
         } catch (txError) {
-            await session.abortTransaction();
+            if (session.inTransaction()) await session.abortTransaction();
             throw txError;
         } finally {
             session.endSession();

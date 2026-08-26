@@ -66,6 +66,8 @@ customerSchema.index({ phone: 1, business: 1 }, { unique: true });
 // Quick lookup for customers with outstanding balance
 customerSchema.index({ business: 1, balance: 1 });
 customerSchema.index({ business: 1, isActive: 1 });
+// Default customer listing sort
+customerSchema.index({ business: 1, isActive: 1, name: 1 });
 
 const Customer = mongoose.model('Customer', customerSchema);
 export default Customer;
