@@ -107,45 +107,54 @@ export const recordCashEntry = async ({
  * GET /cashbook/balance
  * Returns current cash balance + today's summary.
  */
+// Shared by GET /cashbook/balance and the dashboard-summary endpoint —
+// single implementation so the two can never report different numbers.
+export const computeCashBalance = async (rawBusinessId) => {
+    const businessId = rawBusinessId instanceof mongoose.Types.ObjectId
+        ? rawBusinessId
+        : new mongoose.Types.ObjectId(rawBusinessId);
+
+    const latest = await CashBook.findOne({ business: businessId })
+        .sort({ createdAt: -1, entryNumber: -1 })
+        .select('runningBalance')
+        .lean();
+
+    const balance = latest?.runningBalance ?? 0;
+
+    // Today's in/out summary
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const [todaySummary] = await CashBook.aggregate([
+        { $match: { business: businessId, createdAt: { $gte: today } } },
+        {
+            $group: {
+                _id: null,
+                totalIn: {
+                    $sum: { $cond: [{ $eq: ['$direction', 'in'] }, '$amount', 0] },
+                },
+                totalOut: {
+                    $sum: { $cond: [{ $eq: ['$direction', 'out'] }, '$amount', 0] },
+                },
+                entries: { $sum: 1 },
+            },
+        },
+    ]);
+
+    return {
+        balance,
+        today: {
+            totalIn: todaySummary?.totalIn ?? 0,
+            totalOut: todaySummary?.totalOut ?? 0,
+            entries: todaySummary?.entries ?? 0,
+        },
+    };
+};
+
 export const getCurrentBalance = async (req, res) => {
     try {
-        const businessId = new mongoose.Types.ObjectId(req.user.businessId);
-
-        const latest = await CashBook.findOne({ business: businessId })
-            .sort({ createdAt: -1, entryNumber: -1 })
-            .select('runningBalance')
-            .lean();
-
-        const balance = latest?.runningBalance ?? 0;
-
-        // Today's in/out summary
-        const today = new Date();
-        today.setHours(0, 0, 0, 0);
-
-        const [todaySummary] = await CashBook.aggregate([
-            { $match: { business: businessId, createdAt: { $gte: today } } },
-            {
-                $group: {
-                    _id: null,
-                    totalIn: {
-                        $sum: { $cond: [{ $eq: ['$direction', 'in'] }, '$amount', 0] },
-                    },
-                    totalOut: {
-                        $sum: { $cond: [{ $eq: ['$direction', 'out'] }, '$amount', 0] },
-                    },
-                    entries: { $sum: 1 },
-                },
-            },
-        ]);
-
-        res.json({
-            balance,
-            today: {
-                totalIn: todaySummary?.totalIn ?? 0,
-                totalOut: todaySummary?.totalOut ?? 0,
-                entries: todaySummary?.entries ?? 0,
-            },
-        });
+        const result = await computeCashBalance(req.user.businessId);
+        res.json(result);
     } catch (error) {
         console.error('Error getting cash balance:', error);
         res.status(500).json({ message: 'Failed to get cash balance' });

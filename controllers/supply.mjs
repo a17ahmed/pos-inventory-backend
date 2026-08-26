@@ -641,10 +641,12 @@ const deleteSupply = async (req, res) => {
     }
 };
 
-// Get supply stats
-const getSupplyStats = async (req, res) => {
-    try {
-        const businessId = new mongoose.Types.ObjectId(req.user.businessId);
+// Shared by GET /supply/stats and the dashboard-summary endpoint — single
+// implementation so the two can never report different numbers.
+const computeSupplyStats = async (rawBusinessId) => {
+        const businessId = rawBusinessId instanceof mongoose.Types.ObjectId
+            ? rawBusinessId
+            : new mongoose.Types.ObjectId(rawBusinessId);
         const now = new Date();
         const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
         const startOfWeek = new Date(now);
@@ -718,13 +720,19 @@ const getSupplyStats = async (req, res) => {
             ])
         ]);
 
-        res.json({
+        return {
             overall: overall[0] || { totalAmount: 0, totalPaid: 0, totalRemaining: 0, count: 0 },
             thisMonth: thisMonth[0] || { totalAmount: 0, totalPaid: 0, totalRemaining: 0, count: 0 },
             thisWeek: thisWeek[0] || { totalAmount: 0, count: 0 },
             byVendor,
             byStatus
-        });
+        };
+};
+
+const getSupplyStats = async (req, res) => {
+    try {
+        const result = await computeSupplyStats(req.user.businessId);
+        res.json(result);
     } catch (error) {
         console.error('[Supply]', error);
         res.status(500).json({ message: 'Internal server error' });
@@ -877,5 +885,6 @@ export {
     recordPayment,
     deleteSupply,
     getSupplyStats,
+    computeSupplyStats,
     processSupplyReturn
 };

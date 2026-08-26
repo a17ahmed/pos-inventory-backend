@@ -382,16 +382,21 @@ const getCategories = async (req, res) => {
     }
 };
 
+// Shared by GET /product/low-stock and the dashboard-summary endpoint —
+// single implementation so the two can never report different numbers.
+export const computeLowStockProducts = async (businessId) => {
+    return Product.find({
+        business: businessId,
+        isActive: true,
+        trackStock: true,
+        $expr: { $lte: ['$stockQuantity', '$lowStockAlert'] }
+    }).sort({ stockQuantity: 1 });
+};
+
 // Get low stock products
 const getLowStockProducts = async (req, res) => {
     try {
-        const products = await Product.find({
-            business: req.user.businessId,
-            isActive: true,
-            trackStock: true,
-            $expr: { $lte: ['$stockQuantity', '$lowStockAlert'] }
-        }).sort({ stockQuantity: 1 });
-
+        const products = await computeLowStockProducts(req.user.businessId);
         res.json(products);
     } catch (error) {
         console.error('[Product]', error.message);
@@ -549,67 +554,75 @@ const getInventoryValuation = async (req, res) => {
     }
 };
 
+// Shared by GET /product/report/dead-stock and the dashboard-summary
+// endpoint — single implementation so the two can never report different
+// numbers.
+export const computeDeadStock = async (businessId, days = 30) => {
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - Number(days));
+
+    // Get all active products with stock
+    const products = await Product.find({
+        business: businessId,
+        isActive: true,
+        trackStock: true,
+        stockQuantity: { $gt: 0 }
+    }).select('name category stockQuantity costPrice sellingPrice').lean();
+
+    const productIds = products.map(p => p._id);
+
+    // Find products that were sold after cutoff
+    const Bill = (await import('../models/bill.mjs')).default;
+    const soldProducts = await Bill.aggregate([
+        {
+            $match: {
+                business: new mongoose.Types.ObjectId(businessId),
+                status: 'completed',
+                type: 'sale',
+                createdAt: { $gte: cutoffDate },
+            }
+        },
+        { $unwind: '$items' },
+        { $match: { 'items.product': { $in: productIds } } },
+        { $group: { _id: '$items.product', lastSold: { $max: '$createdAt' }, qtySold: { $sum: '$items.qty' } } }
+    ]);
+
+    const soldMap = new Map(soldProducts.map(s => [s._id.toString(), s]));
+
+    // Dead stock = products NOT in soldMap
+    const deadStock = products
+        .filter(p => !soldMap.has(p._id.toString()))
+        .map(p => ({
+            _id: p._id,
+            name: p.name,
+            category: p.category || 'Uncategorized',
+            stockQuantity: p.stockQuantity,
+            costPrice: p.costPrice || 0,
+            sellingPrice: p.sellingPrice || 0,
+            stockValue: p.stockQuantity * (p.costPrice || 0),
+        }))
+        .sort((a, b) => b.stockValue - a.stockValue);
+
+    const totalDeadValue = deadStock.reduce((s, p) => s + p.stockValue, 0);
+
+    return {
+        deadStock,
+        days: Number(days),
+        summary: {
+            deadProducts: deadStock.length,
+            totalProducts: products.length,
+            deadPercentage: products.length > 0 ? Math.round((deadStock.length / products.length) * 10000) / 100 : 0,
+            totalDeadValue: Math.round(totalDeadValue * 100) / 100,
+        }
+    };
+};
+
 // Dead stock report — products not sold in X days
 const getDeadStock = async (req, res) => {
     try {
         const { days = 30 } = req.query;
-        const cutoffDate = new Date();
-        cutoffDate.setDate(cutoffDate.getDate() - Number(days));
-
-        // Get all active products with stock
-        const products = await Product.find({
-            business: req.user.businessId,
-            isActive: true,
-            trackStock: true,
-            stockQuantity: { $gt: 0 }
-        }).select('name category stockQuantity costPrice sellingPrice').lean();
-
-        const productIds = products.map(p => p._id);
-
-        // Find products that were sold after cutoff
-        const Bill = (await import('../models/bill.mjs')).default;
-        const soldProducts = await Bill.aggregate([
-            {
-                $match: {
-                    business: new mongoose.Types.ObjectId(req.user.businessId),
-                    status: 'completed',
-                    type: 'sale',
-                    createdAt: { $gte: cutoffDate },
-                }
-            },
-            { $unwind: '$items' },
-            { $match: { 'items.product': { $in: productIds } } },
-            { $group: { _id: '$items.product', lastSold: { $max: '$createdAt' }, qtySold: { $sum: '$items.qty' } } }
-        ]);
-
-        const soldMap = new Map(soldProducts.map(s => [s._id.toString(), s]));
-
-        // Dead stock = products NOT in soldMap
-        const deadStock = products
-            .filter(p => !soldMap.has(p._id.toString()))
-            .map(p => ({
-                _id: p._id,
-                name: p.name,
-                category: p.category || 'Uncategorized',
-                stockQuantity: p.stockQuantity,
-                costPrice: p.costPrice || 0,
-                sellingPrice: p.sellingPrice || 0,
-                stockValue: p.stockQuantity * (p.costPrice || 0),
-            }))
-            .sort((a, b) => b.stockValue - a.stockValue);
-
-        const totalDeadValue = deadStock.reduce((s, p) => s + p.stockValue, 0);
-
-        res.json({
-            deadStock,
-            days: Number(days),
-            summary: {
-                deadProducts: deadStock.length,
-                totalProducts: products.length,
-                deadPercentage: products.length > 0 ? Math.round((deadStock.length / products.length) * 10000) / 100 : 0,
-                totalDeadValue: Math.round(totalDeadValue * 100) / 100,
-            }
-        });
+        const result = await computeDeadStock(req.user.businessId, days);
+        res.json(result);
     } catch (error) {
         console.error('Error fetching dead stock report:', error);
         res.status(500).json({ message: 'Failed to fetch dead stock report' });

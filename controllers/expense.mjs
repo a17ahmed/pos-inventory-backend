@@ -21,6 +21,19 @@ const CATEGORY_LABELS = {
     other: 'Other'
 };
 
+// Used by the dashboard-summary endpoint to get approved expenses scoped to
+// a period server-side (the old /expense?status=approved list is unscoped
+// by date and paginated, so it can't be reused here without pulling full
+// history — see dashboard controller for the netProfit derivation that
+// consumes this).
+export const computeApprovedExpensesForPeriod = async (businessId, periodStart) => {
+    return Expense.find({
+        business: businessId,
+        status: 'approved',
+        date: { $gte: periodStart },
+    }).select('amount date').lean();
+};
+
 // CREATE - Create new expense
 const createExpense = async (req, res) => {
     try {

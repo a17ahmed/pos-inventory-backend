@@ -1716,11 +1716,15 @@ export const createStandaloneRefund = async (req, res) => {
  * GET /bills/stats?filter=today|week|month&chart=true
  * Single $facet aggregation for today/week/month stats with profit tracking.
  */
-export const getBillStats = async (req, res) => {
-    try {
-        const businessId = new mongoose.Types.ObjectId(req.user.businessId);
-        const filter = req.query.filter || "today";
-        const includeChart = req.query.chart === "true";
+/**
+ * Core bill-stats computation, shared by GET /bill/stats and the
+ * consolidated dashboard-summary endpoint. Keeping a single implementation
+ * guarantees the two callers can never drift in the numbers they report.
+ */
+export const computeBillStats = async (rawBusinessId, filter = "today", includeChart = false) => {
+        const businessId = rawBusinessId instanceof mongoose.Types.ObjectId
+            ? rawBusinessId
+            : new mongoose.Types.ObjectId(rawBusinessId);
 
         const now = new Date();
         const today = new Date(now);
@@ -2083,6 +2087,14 @@ export const getBillStats = async (req, res) => {
             response.chartData = facetResult.chartData || [];
         }
 
+        return response;
+};
+
+export const getBillStats = async (req, res) => {
+    try {
+        const filter = req.query.filter || "today";
+        const includeChart = req.query.chart === "true";
+        const response = await computeBillStats(req.user.businessId, filter, includeChart);
         res.json(response);
     } catch (error) {
         console.error("Error fetching bill stats:", error);
@@ -2094,10 +2106,10 @@ export const getBillStats = async (req, res) => {
  * GET /bills/top-products?limit=12
  * Most sold products aggregation.
  */
-export const getTopProducts = async (req, res) => {
-    try {
-        const businessId = new mongoose.Types.ObjectId(req.user.businessId);
-        const limit = parseInt(req.query.limit) || 12;
+export const computeTopProducts = async (rawBusinessId, limit = 12) => {
+        const businessId = rawBusinessId instanceof mongoose.Types.ObjectId
+            ? rawBusinessId
+            : new mongoose.Types.ObjectId(rawBusinessId);
 
         const topProducts = await Bill.aggregate([
             {
@@ -2155,6 +2167,13 @@ export const getTopProducts = async (req, res) => {
             };
         });
 
+        return result;
+};
+
+export const getTopProducts = async (req, res) => {
+    try {
+        const limit = parseInt(req.query.limit) || 12;
+        const result = await computeTopProducts(req.user.businessId, limit);
         res.json(result);
     } catch (error) {
         console.error("Error fetching top products:", error);
@@ -2306,10 +2325,10 @@ const endOfDay = endOfDayHelper;
  * Shows how many units of each product were sold, revenue, discount, and profit
  * within the given date range.
  */
-export const salesByProduct = async (req, res) => {
-    try {
-        const businessId = new mongoose.Types.ObjectId(req.user.businessId);
-        const { startDate, endDate, productId, category } = req.query;
+export const computeSalesByProduct = async (rawBusinessId, { startDate, endDate, productId, category } = {}) => {
+        const businessId = rawBusinessId instanceof mongoose.Types.ObjectId
+            ? rawBusinessId
+            : new mongoose.Types.ObjectId(rawBusinessId);
 
         const match = {
             business: businessId,
@@ -2389,7 +2408,14 @@ export const salesByProduct = async (req, res) => {
             ? Math.round((summary.totalProfit / summary.netRevenue) * 10000) / 100
             : 0;
 
-        res.json({ products: results, summary });
+        return { products: results, summary };
+};
+
+export const salesByProduct = async (req, res) => {
+    try {
+        const { startDate, endDate, productId, category } = req.query;
+        const result = await computeSalesByProduct(req.user.businessId, { startDate, endDate, productId, category });
+        res.json(result);
     } catch (error) {
         console.error("Error fetching sales by product:", error);
         res.status(500).json({ message: "Failed to fetch sales by product report" });
@@ -2671,11 +2697,12 @@ export const salesByCategory = async (req, res) => {
 // SALES BY CASHIER/EMPLOYEE
 // ═══════════════════════════════════════════════════════════════════════════
 
-export const salesByCashier = async (req, res) => {
-    try {
-        const { startDate, endDate } = req.query;
+export const computeSalesByCashier = async (rawBusinessId, { startDate, endDate } = {}) => {
+        const businessId = rawBusinessId instanceof mongoose.Types.ObjectId
+            ? rawBusinessId
+            : new mongoose.Types.ObjectId(rawBusinessId);
         const match = {
-            business: new mongoose.Types.ObjectId(req.user.businessId),
+            business: businessId,
             status: "completed",
             type: "sale",
         };
@@ -2719,7 +2746,14 @@ export const salesByCashier = async (req, res) => {
             { $sort: { totalSales: -1 } }
         ]);
 
-        res.json({ cashiers: results });
+        return { cashiers: results };
+};
+
+export const salesByCashier = async (req, res) => {
+    try {
+        const { startDate, endDate } = req.query;
+        const result = await computeSalesByCashier(req.user.businessId, { startDate, endDate });
+        res.json(result);
     } catch (error) {
         console.error("Error fetching sales by cashier:", error);
         res.status(500).json({ message: "Failed to fetch sales by cashier" });
@@ -2730,11 +2764,12 @@ export const salesByCashier = async (req, res) => {
 // PAYMENT METHOD BREAKDOWN
 // ═══════════════════════════════════════════════════════════════════════════
 
-export const paymentMethodReport = async (req, res) => {
-    try {
-        const { startDate, endDate } = req.query;
+export const computePaymentMethodReport = async (rawBusinessId, { startDate, endDate } = {}) => {
+        const businessId = rawBusinessId instanceof mongoose.Types.ObjectId
+            ? rawBusinessId
+            : new mongoose.Types.ObjectId(rawBusinessId);
         const match = {
-            business: new mongoose.Types.ObjectId(req.user.businessId),
+            business: businessId,
             status: "completed",
             type: "sale",
         };
@@ -2765,7 +2800,14 @@ export const paymentMethodReport = async (req, res) => {
             percentage: grandTotal > 0 ? Math.round((r.totalAmount / grandTotal) * 10000) / 100 : 0,
         }));
 
-        res.json({ methods, grandTotal });
+        return { methods, grandTotal };
+};
+
+export const paymentMethodReport = async (req, res) => {
+    try {
+        const { startDate, endDate } = req.query;
+        const result = await computePaymentMethodReport(req.user.businessId, { startDate, endDate });
+        res.json(result);
     } catch (error) {
         console.error("Error fetching payment method report:", error);
         res.status(500).json({ message: "Failed to fetch payment method report" });

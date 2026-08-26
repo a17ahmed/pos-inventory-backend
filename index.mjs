@@ -51,6 +51,9 @@ import accessRouter from './routes/access.mjs';
 import cashbookRouter from './routes/cashbook.mjs';
 import closingRouter from './routes/closing.mjs';
 
+// Consolidated analytics endpoints (v1)
+import dashboardRouter from './routes/dashboard.mjs';
+
 // Shared auth routes (refresh token, logout)
 import authRouter from './routes/auth.mjs';
 
@@ -253,6 +256,12 @@ app.use("/business", businessRouter);
 
 // Protected routes (require JWT + access control)
 app.use("/admin", jwtAuth, authorize('admin', 'owner'), adminRouter);
+
+// Consolidated Admin/Owner dashboard analytics (v1) — replaces the 11
+// separate calls the dashboard used to fire on load with one aggregation
+// endpoint. Admin/Owner-only, same as /admin above.
+app.use("/v1/dashboard", jwtAuth, authorize('admin', 'owner'), dashboardRouter);
+
 app.use("/bill", jwtAuth, accessControl, billRouter);
 app.use("/employee", jwtAuth, accessControl, employeeRouter);
 

@@ -61,6 +61,14 @@ export const getAllEmployees = async (req, res) => {
     }
 };
 
+// Used by the dashboard-summary endpoint, which only needs the count that
+// the old GET /employee list's `.length` produced (all employees,
+// regardless of status) — distinct from getEmployeeCount() below, which
+// filters to status: 'active' for a different use case.
+export const computeEmployeeCount = async (businessId) => {
+    return Employee.countDocuments({ business: businessId });
+};
+
 // Get single employee
 export const getEmployeeById = async (req, res) => {
     try {
