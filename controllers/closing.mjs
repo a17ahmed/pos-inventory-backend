@@ -31,6 +31,23 @@ const effectivePaidAt = (paidAt, billCreatedAt) => {
     return t < billT ? billCreatedAt : paidAt;
 };
 
+// Run a set of independent queries concurrently — EXCEPT inside a transaction.
+// A Mongo ClientSession can only have one operation in flight at a time, so
+// firing parallel ops on a live session throws ("transaction number does not
+// match"). On the read path (preview) session is null and these fan out; in
+// createClosing's transaction they fall back to sequential. Correctness first.
+const runIndependent = (thunks, session) =>
+    session
+        ? thunks.reduce(
+              async (accP, thunk) => {
+                  const acc = await accP;
+                  acc.push(await thunk());
+                  return acc;
+              },
+              Promise.resolve([])
+          )
+        : Promise.all(thunks.map((thunk) => thunk()));
+
 // ═══════════════════════════════════════════════════════════════════════════
 // SHARED COMPUTE HELPER — both preview and finalize call this, so preview
 // and finalize are guaranteed identical. Never recompute on read afterwards.
@@ -40,11 +57,106 @@ export const computeClosing = async (businessId, periodStart, periodEnd, session
     const bizId = new mongoose.Types.ObjectId(businessId);
     const commonMatch = { business: bizId, type: "sale", status: "completed" };
 
-    // ── Sale bills created within the period ──────────────────────────────
-    const periodBills = await Bill.find({
-        ...commonMatch,
-        createdAt: { $gte: periodStart, $lte: periodEnd },
-    }).session(session).lean();
+    // ── Fire every independent round-trip at once. None of these six reads
+    // depends on another's result, so on the preview read path they fan out in
+    // parallel instead of serializing ~6 Atlas hops. (The later Customer.find
+    // for phones DOES depend on the periodBills loop below, so it stays where
+    // it is.) All existing pipelines/filters are unchanged — only the waiting
+    // is removed. Inside createClosing's transaction runIndependent falls back
+    // to sequential, since a session can't run parallel ops.
+    const [
+        periodBills,        // Sale bills created within the period
+        billsWithReturns,   // Any sale bill carrying returns (filtered to range below)
+        expenseAgg,         // Approved expenses in period
+        collectionsAgg,     // Prior-period credit collected during this period
+        outstandingAgg,     // Receivable outstanding as of periodEnd
+        cashbookEntry,      // Latest cashbook running balance as of periodEnd
+    ] = await runIndependent(
+        [
+            () =>
+                Bill.find({
+                    ...commonMatch,
+                    createdAt: { $gte: periodStart, $lte: periodEnd },
+                })
+                    .session(session)
+                    .lean(),
+            () =>
+                Bill.find({
+                    ...commonMatch,
+                    "returns.0": { $exists: true },
+                })
+                    .select("returns")
+                    .session(session)
+                    .lean(),
+            () =>
+                Expense.aggregate([
+                    { $match: { business: bizId, status: "approved", date: { $gte: periodStart, $lte: periodEnd } } },
+                    { $group: { _id: null, total: { $sum: "$amount" } } },
+                ]).session(session),
+            () =>
+                Bill.aggregate([
+                    { $match: { ...commonMatch, customer: { $ne: null }, createdAt: { $lt: periodStart } } },
+                    { $unwind: "$payments" },
+                    {
+                        $addFields: {
+                            effectivePaidAt: { $cond: [{ $lt: ["$payments.paidAt", "$createdAt"] }, "$createdAt", "$payments.paidAt"] },
+                        },
+                    },
+                    { $match: { effectivePaidAt: { $gte: periodStart, $lte: periodEnd } } },
+                    { $group: { _id: null, total: { $sum: "$payments.amount" } } },
+                ]).session(session),
+            () =>
+                Bill.aggregate([
+                    { $match: { ...commonMatch, customer: { $ne: null }, createdAt: { $lte: periodEnd } } },
+                    {
+                        $addFields: {
+                            paidToDate: {
+                                $sum: {
+                                    $map: {
+                                        input: { $filter: { input: "$payments", as: "p", cond: { $lte: ["$$p.paidAt", periodEnd] } } },
+                                        as: "p",
+                                        in: "$$p.amount",
+                                    },
+                                },
+                            },
+                            ledgerRefundToDate: {
+                                $sum: {
+                                    $map: {
+                                        input: {
+                                            $filter: {
+                                                input: "$returns",
+                                                as: "r",
+                                                cond: {
+                                                    $and: [
+                                                        { $eq: ["$$r.refundMethod", "ledger_adjust"] },
+                                                        { $lte: ["$$r.returnedAt", periodEnd] },
+                                                    ],
+                                                },
+                                            },
+                                        },
+                                        as: "r",
+                                        in: "$$r.refundAmount",
+                                    },
+                                },
+                            },
+                        },
+                    },
+                    {
+                        $group: {
+                            _id: null,
+                            outstanding: { $sum: { $subtract: ["$total", { $add: ["$paidToDate", "$ledgerRefundToDate"] }] } },
+                        },
+                    },
+                ]).session(session),
+            () =>
+                CashBook.findOne({ business: bizId, createdAt: { $lte: periodEnd } })
+                    .sort({ createdAt: -1, entryNumber: -1 })
+                    .select("runningBalance")
+                    .session(session)
+                    .lean(),
+        ],
+        session
+    );
 
     const grossSales = sumBy(periodBills, (b) => b.total + b.totalDiscount);
     const totalDiscounts = sumBy(periodBills, (b) => b.totalDiscount);
@@ -58,12 +170,8 @@ export const computeClosing = async (businessId, periodStart, periodEnd, session
     );
 
     // ── Returns processed in the period, regardless of the original sale's
-    // period (recognized by returnedAt, not the sale's createdAt) ─────────
-    const billsWithReturns = await Bill.find({
-        ...commonMatch,
-        "returns.0": { $exists: true },
-    }).select("returns").session(session).lean();
-
+    // period (recognized by returnedAt, not the sale's createdAt). The
+    // billsWithReturns fetch was hoisted into the parallel batch above. ────
     const inRangeReturns = [];
     for (const b of billsWithReturns) {
         for (const r of b.returns) {
@@ -81,11 +189,7 @@ export const computeClosing = async (businessId, periodStart, periodEnd, session
     const netSales = salesTotal - totalReturns;
     const grossProfit = netSales - cogs;
 
-    const expenseAgg = await Expense.aggregate([
-        { $match: { business: bizId, status: "approved", date: { $gte: periodStart, $lte: periodEnd } } },
-        { $group: { _id: null, total: { $sum: "$amount" } } },
-    ]).session(session);
-    const totalExpenses = expenseAgg[0]?.total || 0;
+    const totalExpenses = expenseAgg[0]?.total || 0; // expenseAgg hoisted into the parallel batch above
     const netProfit = grossProfit - totalExpenses;
     const costPlusProfit = cogs + grossProfit;
 
@@ -196,61 +300,8 @@ export const computeClosing = async (businessId, periodStart, periodEnd, session
     // itself is built (Bill post-save hook skips walk-in bills entirely) —
     // otherwise these would silently diverge from the real customer ledger
     // whenever a walk-in bill carries an unpaid balance. ─────────────────
-    const collectionsAgg = await Bill.aggregate([
-        { $match: { ...commonMatch, customer: { $ne: null }, createdAt: { $lt: periodStart } } },
-        { $unwind: "$payments" },
-        {
-            $addFields: {
-                effectivePaidAt: { $cond: [{ $lt: ["$payments.paidAt", "$createdAt"] }, "$createdAt", "$payments.paidAt"] },
-            },
-        },
-        { $match: { effectivePaidAt: { $gte: periodStart, $lte: periodEnd } } },
-        { $group: { _id: null, total: { $sum: "$payments.amount" } } },
-    ]).session(session);
+    // collectionsAgg + outstandingAgg were hoisted into the parallel batch above.
     const collectionsReceived = collectionsAgg[0]?.total || 0;
-
-    const outstandingAgg = await Bill.aggregate([
-        { $match: { ...commonMatch, customer: { $ne: null }, createdAt: { $lte: periodEnd } } },
-        {
-            $addFields: {
-                paidToDate: {
-                    $sum: {
-                        $map: {
-                            input: { $filter: { input: "$payments", as: "p", cond: { $lte: ["$$p.paidAt", periodEnd] } } },
-                            as: "p",
-                            in: "$$p.amount",
-                        },
-                    },
-                },
-                ledgerRefundToDate: {
-                    $sum: {
-                        $map: {
-                            input: {
-                                $filter: {
-                                    input: "$returns",
-                                    as: "r",
-                                    cond: {
-                                        $and: [
-                                            { $eq: ["$$r.refundMethod", "ledger_adjust"] },
-                                            { $lte: ["$$r.returnedAt", periodEnd] },
-                                        ],
-                                    },
-                                },
-                            },
-                            as: "r",
-                            in: "$$r.refundAmount",
-                        },
-                    },
-                },
-            },
-        },
-        {
-            $group: {
-                _id: null,
-                outstanding: { $sum: { $subtract: ["$total", { $add: ["$paidToDate", "$ledgerRefundToDate"] }] } },
-            },
-        },
-    ]).session(session);
     const outstandingReceivable = outstandingAgg[0]?.outstanding || 0;
 
     // ── Expected cash on hand — sourced from the cashbook ledger, which
@@ -260,12 +311,7 @@ export const computeClosing = async (businessId, periodStart, periodEnd, session
     // — unlike settlementTotal above — comparing it against a physical
     // count can genuinely fail (shrinkage, an unlogged withdrawal, a
     // miscount), which is the actual point of a till reconciliation.
-    const cashbookEntry = await CashBook.findOne({ business: bizId, createdAt: { $lte: periodEnd } })
-        .sort({ createdAt: -1, entryNumber: -1 })
-        .select("runningBalance")
-        .session(session)
-        .lean();
-    const expectedCash = cashbookEntry?.runningBalance ?? 0;
+    const expectedCash = cashbookEntry?.runningBalance ?? 0; // cashbookEntry hoisted into the parallel batch above
 
     return {
         periodStart,

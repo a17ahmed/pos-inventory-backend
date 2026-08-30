@@ -535,13 +535,16 @@ const getStockMovements = async (req, res) => {
         }
 
         const skip = (Number(page) - 1) * Number(limit);
-        const total = await StockMovement.countDocuments(filter);
 
-        const movements = await StockMovement.find(filter)
-            .sort({ createdAt: -1 })
-            .skip(skip)
-            .limit(Number(limit))
-            .lean();
+        // count and page fetch are independent — fire both at once.
+        const [total, movements] = await Promise.all([
+            StockMovement.countDocuments(filter),
+            StockMovement.find(filter)
+                .sort({ createdAt: -1 })
+                .skip(skip)
+                .limit(Number(limit))
+                .lean(),
+        ]);
 
         res.json({
             movements,

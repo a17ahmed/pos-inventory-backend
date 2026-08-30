@@ -241,13 +241,17 @@ const getAllSupplies = async (req, res) => {
         }
 
         const skip = (Number(page) - 1) * Number(limit);
-        const total = await Supply.countDocuments(filter);
 
-        const supplies = await Supply.find(filter)
-            .sort({ createdAt: -1 })
-            .skip(skip)
-            .limit(Number(limit))
-            .populate('vendor', 'name phone company');
+        // count and page fetch are independent — fire both at once instead of
+        // waiting for the count before starting the page query.
+        const [total, supplies] = await Promise.all([
+            Supply.countDocuments(filter),
+            Supply.find(filter)
+                .sort({ createdAt: -1 })
+                .skip(skip)
+                .limit(Number(limit))
+                .populate('vendor', 'name phone company'),
+        ]);
 
         res.json({
             supplies,

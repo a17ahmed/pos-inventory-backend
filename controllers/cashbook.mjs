@@ -114,32 +114,36 @@ export const computeCashBalance = async (rawBusinessId) => {
         ? rawBusinessId
         : new mongoose.Types.ObjectId(rawBusinessId);
 
-    const latest = await CashBook.findOne({ business: businessId })
-        .sort({ createdAt: -1, entryNumber: -1 })
-        .select('runningBalance')
-        .lean();
-
-    const balance = latest?.runningBalance ?? 0;
-
-    // Today's in/out summary
+    // Today's in/out summary window
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
-    const [todaySummary] = await CashBook.aggregate([
-        { $match: { business: businessId, createdAt: { $gte: today } } },
-        {
-            $group: {
-                _id: null,
-                totalIn: {
-                    $sum: { $cond: [{ $eq: ['$direction', 'in'] }, '$amount', 0] },
+    // The running-balance lookup and today's in/out aggregation are independent
+    // reads over the same collection — fire both at once instead of serially.
+    const [latest, todaySummaryResult] = await Promise.all([
+        CashBook.findOne({ business: businessId })
+            .sort({ createdAt: -1, entryNumber: -1 })
+            .select('runningBalance')
+            .lean(),
+        CashBook.aggregate([
+            { $match: { business: businessId, createdAt: { $gte: today } } },
+            {
+                $group: {
+                    _id: null,
+                    totalIn: {
+                        $sum: { $cond: [{ $eq: ['$direction', 'in'] }, '$amount', 0] },
+                    },
+                    totalOut: {
+                        $sum: { $cond: [{ $eq: ['$direction', 'out'] }, '$amount', 0] },
+                    },
+                    entries: { $sum: 1 },
                 },
-                totalOut: {
-                    $sum: { $cond: [{ $eq: ['$direction', 'out'] }, '$amount', 0] },
-                },
-                entries: { $sum: 1 },
             },
-        },
+        ]),
     ]);
+
+    const balance = latest?.runningBalance ?? 0;
+    const todaySummary = todaySummaryResult[0];
 
     return {
         balance,

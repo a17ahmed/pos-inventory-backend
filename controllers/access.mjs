@@ -44,19 +44,26 @@ export const getEmployeeAccess = async (req, res) => {
     try {
         const { employeeId } = req.params;
 
-        const employee = await Employee.findOne({
-            _id: employeeId,
-            business: req.user.businessId
-        }).select('name employeeId role').lean();
+        // Both lookups key off employeeId (not each other's result), so fetch
+        // them in parallel. The employee guard and the create-on-miss below
+        // still run afterwards, so behavior is unchanged; when the employee
+        // doesn't exist the access read is simply discarded.
+        const [employee, existingAccess] = await Promise.all([
+            Employee.findOne({
+                _id: employeeId,
+                business: req.user.businessId
+            }).select('name employeeId role').lean(),
+            Access.findOne({
+                employee: employeeId,
+                business: req.user.businessId
+            }).lean(),
+        ]);
 
         if (!employee) {
             return res.status(404).json({ message: 'Employee not found' });
         }
 
-        let access = await Access.findOne({
-            employee: employeeId,
-            business: req.user.businessId
-        }).lean();
+        let access = existingAccess;
 
         // If no access doc exists, create one with defaults
         if (!access) {
@@ -124,14 +131,17 @@ export const updateEmployeeAccess = async (req, res) => {
  */
 export const getAllAccess = async (req, res) => {
     try {
-        const employees = await Employee.find({
-            business: req.user.businessId,
-            status: 'active'
-        }).select('name employeeId role').lean();
-
-        const accessDocs = await Access.find({
-            business: req.user.businessId
-        }).lean();
+        // The employee list and access docs are independent reads — fire both
+        // at once and merge below.
+        const [employees, accessDocs] = await Promise.all([
+            Employee.find({
+                business: req.user.businessId,
+                status: 'active'
+            }).select('name employeeId role').lean(),
+            Access.find({
+                business: req.user.businessId
+            }).lean(),
+        ]);
 
         const accessMap = new Map();
         for (const doc of accessDocs) {
