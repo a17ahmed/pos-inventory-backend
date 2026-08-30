@@ -597,8 +597,10 @@ export const createBill = async (req, res) => {
  */
 export const getAllBills = async (req, res) => {
     try {
-        const page = parseInt(req.query.page) || 1;
-        const limit = parseInt(req.query.limit) || 30;
+        // Guard pagination inputs: page >= 1, limit clamped to [1, 100] (default 30).
+        // Prevents unbounded fetches (?limit=100000) and negative skip errors (?page=-5).
+        const page = Math.max(parseInt(req.query.page) || 1, 1);
+        const limit = Math.min(Math.max(parseInt(req.query.limit) || 30, 1), 100);
         const fetchAll = req.query.all === "true";
 
         const query = { business: req.user.businessId };
@@ -608,26 +610,23 @@ export const getAllBills = async (req, res) => {
         else query.type = { $ne: "opening_balance" };
         if (req.query.paymentStatus) query.paymentStatus = req.query.paymentStatus;
 
-        // Date range filter
+        // Date range filter — use timezone-correct start/end-of-day helpers so a
+        // plain "YYYY-MM-DD" is bounded in the server's local TZ, not raw UTC.
         if (req.query.startDate || req.query.endDate) {
             query.createdAt = {};
-            if (req.query.startDate) query.createdAt.$gte = new Date(req.query.startDate);
+            if (req.query.startDate) query.createdAt.$gte = startOfDay(req.query.startDate);
             if (req.query.endDate) query.createdAt.$lte = endOfDay(req.query.endDate);
         }
 
-        const total = await Bill.countDocuments(query);
+        // count + find are independent — run them in parallel to save a round-trip.
+        const findQuery = fetchAll
+            ? Bill.find(query).sort({ createdAt: -1 }).limit(5000).lean()
+            : Bill.find(query).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean();
 
-        let bills;
-        if (fetchAll) {
-            bills = await Bill.find(query).sort({ createdAt: -1 }).limit(5000).lean();
-        } else {
-            const skip = (page - 1) * limit;
-            bills = await Bill.find(query)
-                .sort({ createdAt: -1 })
-                .skip(skip)
-                .limit(limit)
-                .lean();
-        }
+        const [total, bills] = await Promise.all([
+            Bill.countDocuments(query),
+            findQuery,
+        ]);
 
         const totalPages = fetchAll ? 1 : Math.ceil(total / limit);
 
