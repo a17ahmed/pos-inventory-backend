@@ -927,12 +927,15 @@ export const getHoldBills = async (req, res) => {
         if (sortBy === "amount") sortOption = { amountDue: -1 };
         else if (sortBy === "customer") sortOption = { customerName: 1, createdAt: -1 };
 
+        // Safety ceiling: bare array, no pagination. Hold bills are transient and
+        // few, so 1000 is effectively a no-op that just caps a pathological scan.
         const bills = await Bill.find({
             business: req.user.businessId,
             status: "hold",
         })
             .populate("customer", "name phone")
             .sort(sortOption)
+            .limit(1000)
             .lean();
 
         res.json(bills);
@@ -1281,12 +1284,17 @@ export const getReturns = async (req, res) => {
 
         if (req.query.startDate || req.query.endDate) {
             query.createdAt = {};
-            if (req.query.startDate) query.createdAt.$gte = new Date(req.query.startDate);
+            // start-of-day in local TZ (not raw UTC) so early-morning returns aren't dropped
+            if (req.query.startDate) query.createdAt.$gte = startOfDay(req.query.startDate);
             if (req.query.endDate) query.createdAt.$lte = endOfDay(req.query.endDate);
         }
 
+        // Safety ceiling: this returns a bare array (no pagination yet). 2000 is far
+        // above any realistic date-scoped returns list; it only guards against a
+        // full-table scan. Proper pagination here needs a coordinated frontend change.
         const bills = await Bill.find(query)
             .sort({ createdAt: -1 })
+            .limit(2000)
             .lean();
 
         const canSeeProfit = await canViewProfit(req);

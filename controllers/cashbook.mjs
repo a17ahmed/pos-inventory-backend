@@ -172,7 +172,9 @@ export const getCurrentBalance = async (req, res) => {
 export const getCashBook = async (req, res) => {
     try {
         const businessId = new mongoose.Types.ObjectId(req.user.businessId);
-        const { type, startDate, endDate, page = 1, limit = 50 } = req.query;
+        const { type, startDate, endDate, page = 1 } = req.query;
+        // Cap limit to [1,100] so a caller can't request the whole table (?limit=100000).
+        const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 100);
 
         const match = { business: businessId };
 

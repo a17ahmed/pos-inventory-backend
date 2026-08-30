@@ -50,9 +50,12 @@ const generateUniqueEmployeeId = async (businessId, username) => {
 // Get all employees for the logged-in user's business
 export const getAllEmployees = async (req, res) => {
     try {
+        // Safety ceiling: bare array, no pagination. Employees are a small set, so
+        // 1000 is a no-op in practice — it only caps a pathological full scan.
         const employees = await Employee.find({ business: req.user.businessId })
             .select('-password -token')
-            .sort({ name: 1 });
+            .sort({ name: 1 })
+            .limit(1000);
 
         res.status(200).json(employees);
     } catch (error) {

@@ -181,7 +181,11 @@ const getAllProducts = async (req, res) => {
             for (const p of results.flat()) byId.set(p._id.toString(), p);
             products = [...byId.values()].sort((a, b) => a.name.localeCompare(b.name));
         } else {
-            products = await Product.find(query).sort({ name: 1 });
+            // Safety ceiling only — the POS product list is consumed as a bare array
+            // and needs every SKU to sell, so we deliberately do NOT paginate here.
+            // 5000 is above any realistic single-business inventory; true pagination
+            // would require a coordinated frontend change.
+            products = await Product.find(query).sort({ name: 1 }).limit(5000);
         }
 
         res.json(products);
@@ -523,7 +527,9 @@ const getProductBySku = async (req, res) => {
 // Get stock movement history for a product (or all products)
 const getStockMovements = async (req, res) => {
     try {
-        const { productId, type, startDate, endDate, page = 1, limit = 50 } = req.query;
+        const { productId, type, startDate, endDate, page = 1 } = req.query;
+        // Cap limit to [1,100] so a caller can't request the whole table (?limit=100000).
+        const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 100);
         const filter = { business: req.user.businessId };
 
         if (productId) filter.product = productId;

@@ -4,6 +4,7 @@ import { createCustomerSchema, updateCustomerSchema, collectFromCustomerSchema }
 import {
     createOrGetCustomer,
     getCustomers,
+    getCustomerSummary,
     getCustomer,
     updateCustomer,
     deleteCustomer,
@@ -15,6 +16,7 @@ import {
 const router = express.Router();
 
 router.get('/search', searchCustomers);
+router.get('/summary', getCustomerSummary);
 router.post('/', validate(createCustomerSchema), createOrGetCustomer);
 router.get('/', getCustomers);
 router.get('/:id/ledger', getCustomerLedger);

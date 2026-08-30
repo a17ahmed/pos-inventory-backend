@@ -229,7 +229,9 @@ const createSupply = async (req, res) => {
 // Get all supplies
 const getAllSupplies = async (req, res) => {
     try {
-        const { vendor, paymentStatus, startDate, endDate, page = 1, limit = 50 } = req.query;
+        const { vendor, paymentStatus, startDate, endDate, page = 1 } = req.query;
+        // Cap limit to [1,100] so a caller can't request the whole table (?limit=100000).
+        const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 100);
         const filter = { business: req.user.businessId, type: { $ne: 'opening_balance' } };
 
         if (vendor) filter.vendor = vendor;

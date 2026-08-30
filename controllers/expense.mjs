@@ -88,7 +88,9 @@ const createExpense = async (req, res) => {
 // GET ALL - List expenses with filtering
 const getAllExpenses = async (req, res) => {
     try {
-        const { status, category, startDate, endDate, page = 1, limit = 50 } = req.query;
+        const { status, category, startDate, endDate, search, page = 1 } = req.query;
+        // Cap limit to [1,100] so a caller can't request the whole table (?limit=100000).
+        const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 100);
         const skip = (parseInt(page) - 1) * parseInt(limit);
 
         // Build filter
@@ -100,6 +102,12 @@ const getAllExpenses = async (req, res) => {
 
         if (category) {
             filter.category = category;
+        }
+
+        // Server-side text search over the description so the search box works
+        // across the whole dataset, not just the page the client is holding.
+        if (search) {
+            filter.description = { $regex: search, $options: 'i' };
         }
 
         if (startDate || endDate) {
@@ -360,77 +368,82 @@ const getExpenseStats = async (req, res) => {
         today.setHours(0, 0, 0, 0);
         const monthStart = new Date(today.getFullYear(), today.getMonth(), 1);
 
-        // Aggregate approved expenses
-        const stats = await Expense.aggregate([
-            {
-                $match: {
-                    business: businessId,
-                    status: 'approved',
-                    ...(Object.keys(dateFilter).length > 0 ? { date: dateFilter } : {})
-                }
-            },
-            {
-                $group: {
-                    _id: null,
-                    totalExpenses: { $sum: '$amount' },
-                    expenseCount: { $sum: 1 },
-                    // Today's expenses
-                    todayExpenses: {
-                        $sum: {
-                            $cond: [{ $gte: ['$date', today] }, '$amount', 0]
-                        }
-                    },
-                    // This month's expenses
-                    monthExpenses: {
-                        $sum: {
-                            $cond: [{ $gte: ['$date', monthStart] }, '$amount', 0]
+        // The overall stats, per-category breakdown, and pending queue are all
+        // independent DB round-trips — run them in parallel instead of in series.
+        const [stats, byCategory, pendingAgg] = await Promise.all([
+            // Aggregate approved expenses
+            Expense.aggregate([
+                {
+                    $match: {
+                        business: businessId,
+                        status: 'approved',
+                        ...(Object.keys(dateFilter).length > 0 ? { date: dateFilter } : {})
+                    }
+                },
+                {
+                    $group: {
+                        _id: null,
+                        totalExpenses: { $sum: '$amount' },
+                        expenseCount: { $sum: 1 },
+                        // Today's expenses
+                        todayExpenses: {
+                            $sum: {
+                                $cond: [{ $gte: ['$date', today] }, '$amount', 0]
+                            }
+                        },
+                        // This month's expenses
+                        monthExpenses: {
+                            $sum: {
+                                $cond: [{ $gte: ['$date', monthStart] }, '$amount', 0]
+                            }
                         }
                     }
                 }
-            }
+            ]),
+            // Get expenses by category
+            Expense.aggregate([
+                {
+                    $match: {
+                        business: businessId,
+                        status: 'approved',
+                        ...(Object.keys(dateFilter).length > 0 ? { date: dateFilter } : {})
+                    }
+                },
+                {
+                    $group: {
+                        _id: '$category',
+                        total: { $sum: '$amount' },
+                        count: { $sum: 1 }
+                    }
+                },
+                {
+                    $project: {
+                        category: '$_id',
+                        label: {
+                            $switch: {
+                                branches: Object.entries(CATEGORY_LABELS).map(([key, value]) => ({
+                                    case: { $eq: ['$_id', key] },
+                                    then: value
+                                })),
+                                default: '$_id'
+                            }
+                        },
+                        total: 1,
+                        count: 1,
+                        _id: 0
+                    }
+                },
+                { $sort: { total: -1 } }
+            ]),
+            // Pending approvals — count AND rupee total. Global (not date-scoped),
+            // matching how the approval queue is shown regardless of report range.
+            Expense.aggregate([
+                { $match: { business: businessId, status: 'pending' } },
+                { $group: { _id: null, count: { $sum: 1 }, total: { $sum: '$amount' } } }
+            ]),
         ]);
 
-        // Get expenses by category
-        const byCategory = await Expense.aggregate([
-            {
-                $match: {
-                    business: businessId,
-                    status: 'approved',
-                    ...(Object.keys(dateFilter).length > 0 ? { date: dateFilter } : {})
-                }
-            },
-            {
-                $group: {
-                    _id: '$category',
-                    total: { $sum: '$amount' },
-                    count: { $sum: 1 }
-                }
-            },
-            {
-                $project: {
-                    category: '$_id',
-                    label: {
-                        $switch: {
-                            branches: Object.entries(CATEGORY_LABELS).map(([key, value]) => ({
-                                case: { $eq: ['$_id', key] },
-                                then: value
-                            })),
-                            default: '$_id'
-                        }
-                    },
-                    total: 1,
-                    count: 1,
-                    _id: 0
-                }
-            },
-            { $sort: { total: -1 } }
-        ]);
-
-        // Get pending expenses count
-        const pendingCount = await Expense.countDocuments({
-            business: businessId,
-            status: 'pending'
-        });
+        const pending = pendingAgg[0] || { count: 0, total: 0 };
 
         const result = stats[0] || {
             totalExpenses: 0,
@@ -442,7 +455,8 @@ const getExpenseStats = async (req, res) => {
         res.json({
             ...result,
             byCategory,
-            pendingCount,
+            pendingCount: pending.count,
+            pendingTotal: pending.total,
             categoryLabels: CATEGORY_LABELS
         });
     } catch (error) {

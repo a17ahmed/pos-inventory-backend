@@ -90,7 +90,9 @@ export const createOrGetCustomer = async (req, res) => {
 // Get all customers with filters and pagination
 export const getCustomers = async (req, res) => {
     try {
-        const { search, active, hasDues, page = 1, limit = 50 } = req.query;
+        const { search, active, hasDues, page = 1 } = req.query;
+        // Cap limit to [1,100] so a caller can't request the whole table (?limit=100000).
+        const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 100);
         const filter = { business: req.user.businessId };
 
         if (active !== undefined) {
@@ -111,13 +113,16 @@ export const getCustomers = async (req, res) => {
         }
 
         const skip = (Number(page) - 1) * Number(limit);
-        const total = await Customer.countDocuments(filter);
 
-        const customers = await Customer.find(filter)
-            .sort({ name: 1 })
-            .skip(skip)
-            .limit(Number(limit))
-            .lean();
+        // count + find are independent — run them in parallel to save a round-trip.
+        const [total, customers] = await Promise.all([
+            Customer.countDocuments(filter),
+            Customer.find(filter)
+                .sort({ name: 1 })
+                .skip(skip)
+                .limit(Number(limit))
+                .lean(),
+        ]);
 
         res.json({
             customers,
@@ -128,6 +133,43 @@ export const getCustomers = async (req, res) => {
     } catch (error) {
         console.error('Error fetching customers:', error);
         res.status(500).json({ message: 'Failed to fetch customers' });
+    }
+};
+
+// Lightweight KPI summary for the customers screen. Lets the frontend show
+// "Total Customers" and "Outstanding Dues" without downloading every customer
+// row and summing client-side. Dues = sum of positive balances of ACTIVE
+// customers (credit/negative balances excluded), scoped to active so the figure
+// exactly matches the customers list (GET /customer defaults to isActive:true).
+export const getCustomerSummary = async (req, res) => {
+    try {
+        const businessId = req.user.businessId;
+
+        // Scope both figures to ACTIVE customers so they exactly match what the
+        // customers list (GET /customer, which defaults to isActive:true) would
+        // produce if the client accumulated every page and summed dues itself.
+        const [totalCustomers, duesAgg] = await Promise.all([
+            Customer.countDocuments({ business: businessId, isActive: true }),
+            Customer.aggregate([
+                { $match: { business: new mongoose.Types.ObjectId(businessId), isActive: true, balance: { $gt: 0 } } },
+                {
+                    $group: {
+                        _id: null,
+                        totalOutstandingDues: { $sum: '$balance' },
+                        customersWithDues: { $sum: 1 }
+                    }
+                }
+            ])
+        ]);
+
+        res.json({
+            totalCustomers,
+            totalOutstandingDues: duesAgg[0]?.totalOutstandingDues || 0,
+            customersWithDues: duesAgg[0]?.customersWithDues || 0
+        });
+    } catch (error) {
+        console.error('Error fetching customer summary:', error);
+        res.status(500).json({ message: 'Failed to fetch customer summary' });
     }
 };
 

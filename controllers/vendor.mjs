@@ -90,7 +90,9 @@ const getAllVendors = async (req, res) => {
             filter.name = { $regex: search, $options: 'i' };
         }
 
-        const vendors = await Vendor.find(filter).sort({ name: 1 }).lean();
+        // Safety ceiling: bare array, no pagination. Vendors are a small set, so
+        // 2000 is a no-op in practice — it only caps a pathological full scan.
+        const vendors = await Vendor.find(filter).sort({ name: 1 }).limit(2000).lean();
 
         // Aggregate supply totals per vendor
         const vendorIds = vendors.map(v => v._id);
@@ -143,27 +145,29 @@ const getVendor = async (req, res) => {
             return res.status(404).json({ message: 'Vendor not found' });
         }
 
-        const supplies = await Supply.find({
-            vendor: vendor._id,
-            business: req.user.businessId
-        }).sort({ createdAt: -1 });
-
-        const totals = await Supply.aggregate([
-            {
-                $match: {
-                    vendor: new mongoose.Types.ObjectId(vendor._id),
-                    business: new mongoose.Types.ObjectId(req.user.businessId)
+        // supplies list + totals aggregate are independent — run in parallel.
+        const [supplies, totals] = await Promise.all([
+            Supply.find({
+                vendor: vendor._id,
+                business: req.user.businessId
+            }).sort({ createdAt: -1 }),
+            Supply.aggregate([
+                {
+                    $match: {
+                        vendor: new mongoose.Types.ObjectId(vendor._id),
+                        business: new mongoose.Types.ObjectId(req.user.businessId)
+                    }
+                },
+                {
+                    $group: {
+                        _id: null,
+                        totalBusiness: { $sum: '$totalAmount' },
+                        totalPaid: { $sum: '$paidAmount' },
+                        totalRemaining: { $sum: '$remainingAmount' },
+                        supplyCount: { $sum: 1 }
+                    }
                 }
-            },
-            {
-                $group: {
-                    _id: null,
-                    totalBusiness: { $sum: '$totalAmount' },
-                    totalPaid: { $sum: '$paidAmount' },
-                    totalRemaining: { $sum: '$remainingAmount' },
-                    supplyCount: { $sum: 1 }
-                }
-            }
+            ]),
         ]);
 
         res.json({

@@ -35,20 +35,20 @@ export const registerBusiness = async (req, res) => {
             adminPassword
         } = req.body;
 
-        // Validate business type exists
-        const businessType = await BusinessType.findById(businessTypeId);
+        // These three validation reads are independent — run them in parallel,
+        // then apply the guards in order so error messages stay deterministic.
+        const [businessType, existingBusiness, existingAdmin] = await Promise.all([
+            BusinessType.findById(businessTypeId),
+            Business.findOne({ email: businessEmail }),
+            Admin.findOne({ email: adminEmail }),
+        ]);
+
         if (!businessType) {
             return res.status(400).json({ message: 'Invalid business type' });
         }
-
-        // Check if business email already exists
-        const existingBusiness = await Business.findOne({ email: businessEmail });
         if (existingBusiness) {
             return res.status(400).json({ message: 'Business with this email already exists' });
         }
-
-        // Check if admin email already exists
-        const existingAdmin = await Admin.findOne({ email: adminEmail });
         if (existingAdmin) {
             return res.status(400).json({ message: 'Admin with this email already exists' });
         }

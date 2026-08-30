@@ -500,7 +500,9 @@ export const createClosing = async (req, res) => {
 export const getClosings = async (req, res) => {
     try {
         const businessId = new mongoose.Types.ObjectId(req.user.businessId);
-        const { page = 1, limit = 20 } = req.query;
+        const { page = 1 } = req.query;
+        // Cap limit to [1,100] so a caller can't request the whole table (?limit=100000).
+        const limit = Math.min(Math.max(parseInt(req.query.limit) || 20, 1), 100);
         const skip = (parseInt(page) - 1) * parseInt(limit);
 
         const [closings, total] = await Promise.all([
