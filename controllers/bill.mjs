@@ -266,7 +266,7 @@ export const createBill = async (req, res) => {
             return res.status(400).json({ message: "Business ID not found. Please log out and log in again." });
         }
 
-        const { items, idempotencyKey, status } = req.body;
+        const { items, idempotencyKey, status, source, clientCreatedAt } = req.body;
 
         if (!items || items.length === 0) {
             return res.status(400).json({ message: "Bill must have at least one item" });
@@ -293,6 +293,13 @@ export const createBill = async (req, res) => {
         const enrichedItems = await enrichItemsWithCost(items, req.user.businessId);
 
         const now = new Date();
+
+        // Offline sales carry the time they actually happened (clientCreatedAt).
+        // Use it as the bill's business date so reports/cashbook reflect the real
+        // sale time rather than the sync time. Falls back to now for online sales
+        // or if the client omitted it.
+        const isOffline = source === "offline";
+        const businessDate = isOffline && clientCreatedAt ? new Date(clientCreatedAt) : now;
 
         // Build payments array from the request
         const payments = [];
@@ -473,6 +480,8 @@ export const createBill = async (req, res) => {
                 payments,
                 cashGiven: req.body.cashGiven || 0,
                 idempotencyKey: idempotencyKey || undefined,
+                source: isOffline ? "offline" : "online",
+                clientCreatedAt: isOffline && clientCreatedAt ? businessDate : null,
 
                 // People
                 cashier: req.user.id,
@@ -496,11 +505,21 @@ export const createBill = async (req, res) => {
                 // Meta
                 billName: req.body.billName || "",
                 notes: req.body.notes || "",
-                date: toLocalDateString(now),
-                time: toLocalTimeString(now),
+                date: toLocalDateString(businessDate),
+                time: toLocalTimeString(businessDate),
             });
 
-            const saved = await bill.save({ session });
+            // For offline sales, backdate createdAt to the real sale time so
+            // createdAt-based reports/aggregations match `date`/`time`. Pass
+            // timestamps:false so Mongoose doesn't overwrite it with now.
+            const saveOpts = { session };
+            if (isOffline && clientCreatedAt) {
+                bill.createdAt = businessDate;
+                bill.updatedAt = businessDate;
+                saveOpts.timestamps = false;
+            }
+
+            const saved = await bill.save(saveOpts);
 
             // Update discount history with calculated amounts
             if (saved.discountHistory.length > 0 && saved.totalDiscount > 0) {

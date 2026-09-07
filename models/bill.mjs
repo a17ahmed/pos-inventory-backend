@@ -157,6 +157,14 @@ const billSchema = new Schema(
         change: { type: Number, default: 0 },
         idempotencyKey: { type: String },
 
+        // Offline-first sync metadata.
+        // source: "offline" bills were made while the POS was disconnected and
+        // synced later. clientCreatedAt is when the sale actually happened; it is
+        // mirrored into createdAt/date/time so reports reflect the real sale time,
+        // not the sync time. See docs/idempotency.md.
+        source: { type: String, enum: ["offline", "online"], default: "online" },
+        clientCreatedAt: { type: Date, default: null },
+
         // People
         cashier: { type: Schema.Types.ObjectId, ref: "Employee", default: null },
         cashierName: { type: String, default: "" },

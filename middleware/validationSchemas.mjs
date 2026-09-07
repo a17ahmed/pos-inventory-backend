@@ -282,6 +282,7 @@ export const createCustomerSchema = Joi.object({
     address: Joi.string().allow(""),
     notes: Joi.string().allow(""),
     openingBalance: Joi.number().min(0),
+    idempotencyKey: Joi.string().allow(""),
 });
 
 export const updateCustomerSchema = Joi.object({
@@ -293,6 +294,7 @@ export const updateCustomerSchema = Joi.object({
     isActive: Joi.boolean(),
     creditDays: Joi.number().min(0),
     creditLimit: Joi.number().min(0),
+    idempotencyKey: Joi.string().allow(""),
 });
 
 export const collectFromCustomerSchema = Joi.object({
@@ -300,6 +302,7 @@ export const collectFromCustomerSchema = Joi.object({
     method: Joi.string().valid("cash", "card", "online", "store_credit").default("cash"),
     note: Joi.string().allow("").default(""),
     reference: Joi.string().allow("").default(""),
+    idempotencyKey: Joi.string().allow(""),
 });
 
 // ═══════════════════════════════════════════════════════════════
@@ -442,6 +445,9 @@ export const createBillSchema = Joi.object({
     notes: Joi.string().allow(""),
     holdNote: Joi.string().allow(""),
     idempotencyKey: Joi.string().allow(""),
+    // Offline-first sync metadata (see docs/idempotency.md)
+    source: Joi.string().valid("offline", "online").allow(""),
+    clientCreatedAt: Joi.date(),
 });
 
 export const holdBillSchema = Joi.object({

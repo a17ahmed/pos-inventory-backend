@@ -1,6 +1,7 @@
 import Customer from '../models/customer.mjs';
 import Bill from '../models/bill.mjs';
 import Counter from '../models/counter.mjs';
+import Payment from '../models/payment.mjs';
 import mongoose from 'mongoose';
 import { recordCashEntry } from './cashbook.mjs';
 import { startOfDay, endOfDay, toLocalDateString, toLocalTimeString } from '../utils/dateHelpers.mjs';
@@ -8,10 +9,25 @@ import { startOfDay, endOfDay, toLocalDateString, toLocalTimeString } from '../u
 // Create or get customer (upsert by phone + business)
 export const createOrGetCustomer = async (req, res) => {
     try {
-        const { name, phone, email, address, notes, openingBalance } = req.body;
+        const { name, phone, email, address, notes, openingBalance, idempotencyKey } = req.body;
 
         if (!name || !phone) {
             return res.status(400).json({ message: 'Name and phone are required' });
+        }
+
+        // ── Idempotency guard (offline sync) ───────────────────────
+        // Replay of a previously-synced create → return the same customer so the
+        // client can map its offline temp id (local-…) to the real _id. This is
+        // checked in addition to the natural upsert-by-phone dedup below, in case
+        // the customer's phone was edited between the original create and a replay.
+        if (idempotencyKey) {
+            const byKey = await Customer.findOne({
+                business: req.user.businessId,
+                idempotencyKey,
+            });
+            if (byKey) {
+                return res.status(200).json(byKey);
+            }
         }
 
         // Check if customer exists but is deactivated
@@ -31,6 +47,11 @@ export const createOrGetCustomer = async (req, res) => {
             ...(notes !== undefined && { notes }),
         };
 
+        // Persist the key on insert only, so a later edit/replay never overwrites it.
+        // Spread as a whole operator so we never send an empty $setOnInsert (which
+        // some MongoDB versions reject).
+        const setOnInsert = idempotencyKey ? { $setOnInsert: { idempotencyKey } } : {};
+
         const obAmount = !existing && openingBalance !== undefined ? Number(openingBalance) : 0;
 
         if (obAmount > 0) {
@@ -41,7 +62,7 @@ export const createOrGetCustomer = async (req, res) => {
 
                 const customer = await Customer.findOneAndUpdate(
                     { phone: phone.trim(), business: req.user.businessId },
-                    { ...updateFields, openingBalance: obAmount },
+                    { ...updateFields, openingBalance: obAmount, ...setOnInsert },
                     { new: true, upsert: true, setDefaultsOnInsert: true, session }
                 );
 
@@ -76,12 +97,24 @@ export const createOrGetCustomer = async (req, res) => {
         } else {
             const customer = await Customer.findOneAndUpdate(
                 { phone: phone.trim(), business: req.user.businessId },
-                updateFields,
+                { ...updateFields, ...setOnInsert },
                 { new: true, upsert: true, setDefaultsOnInsert: true }
             );
             res.status(200).json(customer);
         }
     } catch (error) {
+        // Race: a concurrent replay won the insert (phone or idempotencyKey
+        // unique index). Return the existing record so the client treats it as
+        // an idempotent replay rather than a failure.
+        if (error.code === 11000) {
+            const existing = await Customer.findOne({
+                business: req.user.businessId,
+                ...(req.body.idempotencyKey
+                    ? { idempotencyKey: req.body.idempotencyKey }
+                    : { phone: (req.body.phone || '').trim() }),
+            });
+            if (existing) return res.status(200).json(existing);
+        }
         console.error('Error creating/getting customer:', error);
         res.status(500).json({ message: 'Failed to save customer' });
     }
@@ -431,7 +464,7 @@ export const getCustomerLedger = async (req, res) => {
 // FIFO collection — customer pays us a lump sum; distribute across outstanding bills (oldest first)
 export const collectFromCustomer = async (req, res) => {
     try {
-        const { amount, method, note, reference } = req.body;
+        const { amount, method, note, reference, idempotencyKey } = req.body;
         const payAmount = Number(amount);
 
         if (!payAmount || payAmount <= 0) {
@@ -446,6 +479,22 @@ export const collectFromCustomer = async (req, res) => {
 
         if (!customer) {
             return res.status(404).json({ message: 'Customer not found' });
+        }
+
+        // ── Idempotency guard (offline sync) ───────────────────────
+        // MUST run before the "no outstanding bills" check below: on replay the
+        // first collect already settled the dues, so a naive re-run would 400
+        // with "No outstanding bills" and the client would quarantine a valid,
+        // already-applied payment. Returning the stored Payment (200) instead
+        // lets the client mark it synced. See docs/idempotency.md.
+        if (idempotencyKey) {
+            const prior = await Payment.findOne({
+                business: req.user.businessId,
+                idempotencyKey,
+            }).lean();
+            if (prior) {
+                return res.status(200).json(formatCollectReplay(prior, customer));
+            }
         }
 
         // Fetch outstanding bills — oldest first (FIFO)
@@ -540,6 +589,31 @@ export const collectFromCustomer = async (req, res) => {
                 });
             }
 
+            // Idempotency anchor: one record per keyed collect operation. Created
+            // inside the transaction so it commits atomically with the allocations;
+            // the partial unique index on (business, idempotencyKey) makes a
+            // concurrent replay fail with 11000 (handled in the catch below).
+            // Skipped for online collects (no key) so they behave exactly as before.
+            if (idempotencyKey) {
+                await Payment.create([{
+                    business: req.user.businessId,
+                    customer: customer._id,
+                    amount: payAmount,
+                    method: paymentMethod,
+                    note: note || '',
+                    reference: reference || '',
+                    allocations: allocations.map(a => ({
+                        billId: a.billId,
+                        billNumber: a.billNumber,
+                        allocated: a.allocated,
+                        newStatus: a.newStatus,
+                    })),
+                    performedBy: receivedByName,
+                    performedById: req.user.id,
+                    idempotencyKey,
+                }], { session });
+            }
+
             await session.commitTransaction();
         } catch (txError) {
             await session.abortTransaction();
@@ -571,10 +645,46 @@ export const collectFromCustomer = async (req, res) => {
             }
         });
     } catch (error) {
+        // Race: a concurrent replay committed first (duplicate idempotencyKey).
+        // Return that Payment so the client treats this as an idempotent replay.
+        if (error.code === 11000 && req.body.idempotencyKey) {
+            const prior = await Payment.findOne({
+                business: req.user.businessId,
+                idempotencyKey: req.body.idempotencyKey,
+            }).lean();
+            if (prior) {
+                const customer = await Customer.findOne({
+                    _id: req.params.id,
+                    business: req.user.businessId,
+                }).lean();
+                return res.status(200).json(formatCollectReplay(prior, customer));
+            }
+        }
         console.error('Error in FIFO collection:', error);
         res.status(500).json({ message: error.message });
     }
 };
+
+// Build the collect response body from a stored Payment (idempotent replay),
+// matching the shape returned by a first-time collect so the client parses it
+// the same way. `customer` may be null if it was since deleted.
+const formatCollectReplay = (payment, customer) => ({
+    message: `Payment of Rs ${payment.amount} already recorded (idempotent replay)`,
+    alreadyProcessed: true,
+    customer: { _id: payment.customer, name: customer?.name || '' },
+    payment: {
+        _id: payment._id,
+        totalAmount: payment.amount,
+        method: payment.method,
+        reference: payment.reference || '',
+        paidAt: payment.createdAt,
+        receivedByName: payment.performedBy || '',
+    },
+    allocations: payment.allocations || [],
+    summary: {
+        billsAffected: (payment.allocations || []).length,
+    },
+});
 
 // Search customers by name or phone
 export const searchCustomers = async (req, res) => {

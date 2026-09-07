@@ -58,7 +58,11 @@ const customerSchema = new mongoose.Schema({
     // Stats
     totalPurchases: { type: Number, default: 0 },
     totalReturns: { type: Number, default: 0 },
-    lastPurchase: { type: Date, default: null }
+    lastPurchase: { type: Date, default: null },
+
+    // Offline-first sync: dedupe key attached by the client on create. Set once,
+    // on insert only (see createOrGetCustomer). See docs/idempotency.md.
+    idempotencyKey: { type: String }
 }, { timestamps: true });
 
 // Unique phone per business
@@ -68,6 +72,11 @@ customerSchema.index({ business: 1, balance: 1 });
 customerSchema.index({ business: 1, isActive: 1 });
 // Default customer listing sort
 customerSchema.index({ business: 1, isActive: 1, name: 1 });
+// Idempotency: only keyed docs are constrained, scoped per business.
+customerSchema.index(
+    { business: 1, idempotencyKey: 1 },
+    { unique: true, partialFilterExpression: { idempotencyKey: { $type: "string" } } }
+);
 
 const Customer = mongoose.model('Customer', customerSchema);
 export default Customer;
