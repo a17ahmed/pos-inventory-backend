@@ -17,7 +17,11 @@ const accessSchema = new Schema(
             pos: {
                 view: { type: Boolean, default: true },
                 create: { type: Boolean, default: true },
-                viewProfit: { type: Boolean, default: false }
+                viewProfit: { type: Boolean, default: false },
+                // Create/update/delete a customer's special rates
+                saveCustomerRates: { type: Boolean, default: false },
+                // Complete a bill where an item discount exceeds maxDiscountPercent
+                sellBeyondLimit: { type: Boolean, default: false }
             },
             pendingBills: {
                 view: { type: Boolean, default: true },

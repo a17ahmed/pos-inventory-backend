@@ -33,8 +33,9 @@ const productSchema = new Schema(
             type: Number,
             default: 0
         },
-        // Cashier-facing discount ceiling for this product. null = no explicit
-        // cap, just enforce the cost-price floor at bill time.
+        // Cashier-facing discount ceiling: a share of the item's PROFIT
+        // (sellingPrice - costPrice), so it can never go below cost.
+        // null = no explicit cap, the full profit may be discounted.
         maxDiscountPercent: {
             type: Number,
             min: 0,

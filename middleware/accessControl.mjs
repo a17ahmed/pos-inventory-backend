@@ -35,18 +35,24 @@ export const invalidateAccessCache = (employeeId, businessId) => {
 };
 
 /**
- * Whether the requesting user can see profit/cost figures.
- * Admins always can; employees need permissions.pos.viewProfit === true.
+ * Whether the requesting user has permissions.pos[action] === true.
+ * Admins always do.
  */
-export const canViewProfit = async (req) => {
+export const hasPosPermission = async (req, action) => {
     if (req.user?.adminId) return true;
 
     const employeeId = req.user?.id || req.user?.employeeId;
     if (!employeeId) return false;
 
     const permissions = await getAccessForEmployee(employeeId, req.user.businessId);
-    return permissions?.pos?.viewProfit === true;
+    return permissions?.pos?.[action] === true;
 };
+
+/**
+ * Whether the requesting user can see profit/cost figures.
+ * Admins always can; employees need permissions.pos.viewProfit === true.
+ */
+export const canViewProfit = (req) => hasPosPermission(req, 'viewProfit');
 
 /**
  * Invalidate all cached access entries for a business.
@@ -120,7 +126,16 @@ const ROUTE_PERMISSIONS = {
             '/*/collect': { module: 'customers', action: 'edit' }
         },
         PATCH:  { _default: { module: 'customers', action: 'edit' } },
-        DELETE: { _default: { module: 'customers', action: 'delete' } }
+        // Special-rate writes are checked in the controller against
+        // pos.saveCustomerRates (null = pass through here)
+        PUT:    {
+            '/*/rates':   null,
+            '/*/rates/*': null
+        },
+        DELETE: {
+            _default:     { module: 'customers', action: 'delete' },
+            '/*/rates/*': null
+        }
     },
 
     '/employee': {

@@ -51,6 +51,12 @@ const billItemSchema = new Schema({
 
     // Per-item discount (flat ₹ off, frontend converts % to flat before sending)
     discountAmount: { type: Number, default: 0 },
+    // Where the discount came from. 'customerRate' = the customer's saved special rate
+    discountSource: { type: String, enum: ["manual", "customerRate"], default: "manual" },
+    // The special rate (per unit) that was applied, for audit/reports
+    customerRate: { type: Number, default: null },
+    // true = cashier chose to sell beyond the product's maxDiscountPercent cap
+    limitOverride: { type: Boolean, default: false },
 
     itemTotal: { type: Number, default: 0 },
     itemProfit: { type: Number, default: 0 },

@@ -94,7 +94,10 @@ const businessSchema = new Schema(
             enableKitchenDisplay: { type: Boolean, default: false },
             enableDeals: { type: Boolean, default: true },
             requireTableForDineIn: { type: Boolean, default: false },
-            autoSendToKitchen: { type: Boolean, default: true }
+            autoSendToKitchen: { type: Boolean, default: true },
+            // Allow a limit-override bill line to go below cost price
+            // (POS warns first). Off = the cost-price floor is always enforced.
+            allowSellBelowCost: { type: Boolean, default: false }
         },
         isActive: {
             type: Boolean,

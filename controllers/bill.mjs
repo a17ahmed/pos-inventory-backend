@@ -3,11 +3,12 @@ import Bill from "../models/bill.mjs";
 import Counter from "../models/counter.mjs";
 import Product from "../models/product.mjs";
 import Customer from "../models/customer.mjs";
+import Business from "../models/business.mjs";
 import Expense from "../models/expense.mjs";
 import StockMovement from "../models/stockMovement.mjs";
 import { recordCashEntry } from "./cashbook.mjs";
 import { startOfToday, startOfMonth, startOfWeek, endOfDay as endOfDayHelper, startOfDay, toLocalDateString, toLocalTimeString, getTimezone } from "../utils/dateHelpers.mjs";
-import { canViewProfit } from "../middleware/accessControl.mjs";
+import { canViewProfit, hasPosPermission } from "../middleware/accessControl.mjs";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -96,13 +97,36 @@ const enrichItemsWithCost = async (items, businessId) => {
 };
 
 /**
- * Validate every line item's discountAmount against its product's cost-price
- * floor and optional maxDiscountPercent cap. Returns { error, capTotal } --
- * error is a user-facing message (or null if all items pass), capTotal is
- * the sum of each item's individually allowed cap (used for the whole-bill
- * discount check).
+ * Normalise the special-rate fields on bill items. discountSource
+ * 'customerRate' is only kept when the bill has a customer; absent fields get
+ * the old-client defaults ('manual', null, false).
  */
-const validateDiscountLimits = (enrichedItems) => {
+const normalizeDiscountFields = (items, hasCustomer) =>
+    items.map((item) => {
+        const fromRate = item.discountSource === "customerRate" && hasCustomer;
+        return {
+            ...item,
+            discountSource: fromRate ? "customerRate" : "manual",
+            customerRate: fromRate && item.customerRate != null ? item.customerRate : null,
+            limitOverride: item.limitOverride === true,
+        };
+    });
+
+/**
+ * Validate every line item's discountAmount. Returns { error, capTotal } --
+ * error is a user-facing message (or null if all items pass), capTotal is
+ * the sum of each item's allowed cap (used for the whole-bill discount check).
+ *
+ * Per line:
+ *   - discount can never exceed the line total (price * qty)
+ *   - cap = maxDiscountPercent of the line PROFIT, or the full profit when no
+ *     percent is set (same as the POS's getItemDiscountCap), so the price
+ *     never goes below cost
+ *   - limitOverride lines (permission checked by the caller) skip the percent
+ *     cap; they may only go below cost when the business setting
+ *     allowSellBelowCost is on
+ */
+const validateDiscountLimits = (enrichedItems, { allowSellBelowCost = false } = {}) => {
     let capTotal = 0;
 
     for (const item of enrichedItems) {
@@ -111,15 +135,24 @@ const validateDiscountLimits = (enrichedItems) => {
         const discountAmount = item.discountAmount || 0;
         const costPrice = item.costPrice || 0;
 
-        const hardFloorCap = lineGross - costPrice * qty;
+        if (discountAmount > lineGross + 0.01) {
+            return { error: `Discount on ${item.name} exceeds the item total`, capTotal };
+        }
+
+        const profitCap = Math.max(0, lineGross - costPrice * qty);
         const percentCap = item.maxDiscountPercent != null
-            ? (lineGross * item.maxDiscountPercent) / 100
-            : Infinity;
+            ? (profitCap * item.maxDiscountPercent) / 100
+            : profitCap;
+        capTotal += percentCap;
 
-        const effectiveCap = Math.max(0, Math.min(hardFloorCap, percentCap));
-        capTotal += effectiveCap;
+        if (item.limitOverride) {
+            if (!allowSellBelowCost && discountAmount > profitCap + 0.01) {
+                return { error: `Cannot sell ${item.name} below cost price`, capTotal };
+            }
+            continue;
+        }
 
-        if (discountAmount > effectiveCap + 0.01) {
+        if (discountAmount > percentCap + 0.01) {
             return { error: `Discount on ${item.name} exceeds the allowed limit`, capTotal };
         }
     }
@@ -290,7 +323,10 @@ export const createBill = async (req, res) => {
         const billStatus = status === "hold" ? "hold" : "completed";
 
         // ── Enrich items with costPrice ────────────────────────────
-        const enrichedItems = await enrichItemsWithCost(items, req.user.businessId);
+        const enrichedItems = normalizeDiscountFields(
+            await enrichItemsWithCost(items, req.user.businessId),
+            !!req.body.customer
+        );
 
         const now = new Date();
 
@@ -319,8 +355,21 @@ export const createBill = async (req, res) => {
             });
         }
 
+        // ── Selling beyond the discount cap needs pos.sellBeyondLimit ──
+        let allowSellBelowCost = false;
+        if (enrichedItems.some((i) => i.limitOverride)) {
+            if (!(await hasPosPermission(req, "sellBeyondLimit"))) {
+                return res.status(403).json({ message: "You are not allowed to sell beyond the discount limit" });
+            }
+            const business = await Business.findById(req.user.businessId)
+                .select("settings.allowSellBelowCost")
+                .lean();
+            allowSellBelowCost = business?.settings?.allowSellBelowCost === true;
+        }
+
         // ── Discount cap validation: cost-price floor + optional per-product max% ──
-        const { error: discountCapError, capTotal: allowedDiscountCapTotal } = validateDiscountLimits(enrichedItems);
+        const { error: discountCapError, capTotal: allowedDiscountCapTotal } =
+            validateDiscountLimits(enrichedItems, { allowSellBelowCost });
         if (discountCapError) {
             return res.status(400).json({ message: discountCapError });
         }
@@ -798,7 +847,10 @@ export const holdBill = async (req, res) => {
             return res.status(400).json({ message: "Bill must have at least one item" });
         }
 
-        const enrichedItems = await enrichItemsWithCost(items, req.user.businessId);
+        const enrichedItems = normalizeDiscountFields(
+            await enrichItemsWithCost(items, req.user.businessId),
+            !!req.body.customer
+        );
         const now = new Date();
 
         // Build payment if partial payment was made

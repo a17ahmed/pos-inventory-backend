@@ -3,15 +3,31 @@ import Bill from '../models/bill.mjs';
 import Counter from '../models/counter.mjs';
 import mongoose from 'mongoose';
 import { recordCashEntry } from './cashbook.mjs';
+import { buildRateEntries, RATE_MESSAGES } from './customerRates.mjs';
+import { hasPosPermission } from '../middleware/accessControl.mjs';
 import { startOfDay, endOfDay, toLocalDateString, toLocalTimeString } from '../utils/dateHelpers.mjs';
 
 // Create or get customer (upsert by phone + business)
 export const createOrGetCustomer = async (req, res) => {
     try {
-        const { name, phone, email, address, notes, openingBalance } = req.body;
+        const { name, phone, email, address, notes, openingBalance, specialRates } = req.body;
 
         if (!name || !phone) {
             return res.status(400).json({ message: 'Name and phone are required' });
+        }
+
+        // Optional special rates — only applied when the customer is created
+        // ($setOnInsert), never to an existing customer matched by phone.
+        let rateEntries = [];
+        if (Array.isArray(specialRates) && specialRates.length > 0) {
+            if (!(await hasPosPermission(req, 'saveCustomerRates'))) {
+                return res.status(403).json({ message: RATE_MESSAGES.noPermission });
+            }
+            const { entries, error } = await buildRateEntries(specialRates, req);
+            if (error) {
+                return res.status(error.status).json({ message: error.message });
+            }
+            rateEntries = entries;
         }
 
         // Check if customer exists but is deactivated
@@ -29,6 +45,7 @@ export const createOrGetCustomer = async (req, res) => {
             ...(email !== undefined && { email }),
             ...(address !== undefined && { address }),
             ...(notes !== undefined && { notes }),
+            ...(rateEntries.length > 0 && { $setOnInsert: { specialRates: rateEntries } }),
         };
 
         const obAmount = !existing && openingBalance !== undefined ? Number(openingBalance) : 0;
