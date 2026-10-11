@@ -492,18 +492,25 @@ export const cancelHoldBillSchema = Joi.object({
     refundOnCancel: Joi.number().min(0),
 });
 
+const returnReason = Joi.string().valid("defective", "wrong_item", "changed_mind", "expired", "damaged", "other");
+
+// Either `items` (specific quantities) or `fullReturn: true` (everything still
+// on the bill). The either/or rule is enforced in processReturn so the message
+// is readable.
 export const processReturnSchema = Joi.object({
     items: Joi.array()
         .items(
             Joi.object({
                 itemId: objectId.required(),
                 quantity: Joi.number().integer().positive().required(),
-                reason: Joi.string().valid("defective", "wrong_item", "changed_mind", "expired", "damaged", "other"),
+                reason: returnReason,
                 reasonNote: Joi.string().allow(""),
             })
-        )
-        .min(1)
-        .required(),
+        ),
+    fullReturn: Joi.boolean(),
+    // Used for every item when fullReturn is true
+    reason: returnReason,
+    reasonNote: Joi.string().allow(""),
     notes: Joi.string().allow(""),
 });
 

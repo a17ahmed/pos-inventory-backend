@@ -1124,12 +1124,20 @@ export const cancelHoldBill = async (req, res) => {
  * Process a return against an existing completed bill.
  * Adds an entry to bill.returns[], updates item returnedQty, restores stock.
  * The post-save hook handles customer ledger sync.
+ *
+ * Body: either { items: [{ itemId, quantity, reason, reasonNote }] } or
+ * { fullReturn: true, reason, reasonNote } — the latter returns every item's
+ * remaining quantity (so on a partially-returned bill only what's left).
  */
 export const processReturn = async (req, res) => {
     try {
-        const { items } = req.body;
+        const { items, fullReturn } = req.body;
+        const hasItems = Array.isArray(items) && items.length > 0;
 
-        if (!items || items.length === 0) {
+        if (fullReturn === true && hasItems) {
+            return res.status(400).json({ message: "Send either items or fullReturn, not both" });
+        }
+        if (fullReturn !== true && !hasItems) {
             return res.status(400).json({ message: "No items to return" });
         }
 
@@ -1167,8 +1175,27 @@ export const processReturn = async (req, res) => {
             const isCustomerBill = !!bill.customer;
             refundMethod = isCustomerBill ? "ledger_adjust" : "cash";
 
+            // Full return: every item's remaining quantity, one shared reason
+            let returnLines = items;
+            if (fullReturn === true) {
+                returnLines = bill.items
+                    .filter((i) => i.qty - i.returnedQty > 0)
+                    .map((i) => ({
+                        itemId: i._id.toString(),
+                        quantity: i.qty - i.returnedQty,
+                        reason: req.body.reason,
+                        reasonNote: req.body.reasonNote,
+                    }));
+
+                if (returnLines.length === 0) {
+                    await session.abortTransaction();
+                    session.endSession();
+                    return res.status(400).json({ message: "This bill has already been fully returned" });
+                }
+            }
+
             // Validate return quantities don't exceed remaining
-            for (const returnItem of items) {
+            for (const returnItem of returnLines) {
                 const billItem = bill.items.id(returnItem.itemId);
                 if (!billItem) {
                     await session.abortTransaction();
@@ -1195,7 +1222,7 @@ export const processReturn = async (req, res) => {
             let totalProfitLost = 0;
             const returnItems = [];
 
-            for (const returnItem of items) {
+            for (const returnItem of returnLines) {
                 const billItem = bill.items.id(returnItem.itemId);
 
                 const itemTax = (billItem.gst || 0) * billItem.qty;
@@ -1224,6 +1251,25 @@ export const processReturn = async (req, res) => {
                 billItem.returnedQty += returnItem.quantity;
             }
 
+            // Last return on the bill: refund exactly what's left of the total,
+            // so per-item rounding across several returns can't refund a paisa
+            // more or less than the customer was billed. The difference goes on
+            // the last returned item so item refunds still add up.
+            if (bill.items.every((i) => i.returnedQty >= i.qty)) {
+                const alreadyRefunded = bill.returns.reduce((sum, r) => sum + (r.refundAmount || 0), 0);
+                const remainingRefund = Math.round(((bill.total || 0) - alreadyRefunded) * 100) / 100;
+                const adjustment = Math.round((remainingRefund - totalRefundAmount) * 100) / 100;
+
+                // Only correct rounding drift, never a real difference
+                if (adjustment !== 0 && Math.abs(adjustment) < 1) {
+                    const lastItem = returnItems[returnItems.length - 1];
+                    lastItem.refundAmount = Math.round((lastItem.refundAmount + adjustment) * 100) / 100;
+                    lastItem.profitLost = Math.round((lastItem.profitLost + adjustment) * 100) / 100;
+                    totalRefundAmount = remainingRefund;
+                    totalProfitLost = Math.round((totalProfitLost + adjustment) * 100) / 100;
+                }
+            }
+
             // For partially-paid bills: only return what was actually received.
             // paidRatio is the fraction of the bill total that has been paid.
             // - ledger_adjust (customer bills): the formula amountDue = effectiveTotal - amountPaid
@@ -1241,7 +1287,7 @@ export const processReturn = async (req, res) => {
             }
 
             // Restore stock for returned items
-            const stockItems = items
+            const stockItems = returnLines
                 .map((ri) => {
                     const billItem = bill.items.id(ri.itemId);
                     return billItem?.product
