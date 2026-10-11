@@ -487,6 +487,12 @@ export const holdBillSchema = Joi.object({
     notes: Joi.string().allow(""),
 });
 
+// Cancel a completed sale. `reason` is required — checked in the controller
+// so the message is readable.
+export const cancelSaleBillSchema = Joi.object({
+    reason: Joi.string().allow("").max(300),
+});
+
 export const cancelHoldBillSchema = Joi.object({
     cancelReason: Joi.string().allow(""),
     refundOnCancel: Joi.number().min(0),

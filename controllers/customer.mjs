@@ -297,6 +297,9 @@ export const getCustomerLedger = async (req, res) => {
         }
 
         const { startDate, endDate } = req.query;
+        // Cancelled sales are excluded by default (statements/reports stay clean);
+        // the ledger screen can ask for them as zero-effect rows.
+        const includeCancelled = req.query.includeCancelled === 'true';
 
         const billFilter = {
             customer: new mongoose.Types.ObjectId(customer._id),
@@ -310,12 +313,33 @@ export const getCustomerLedger = async (req, res) => {
             if (endDate) billFilter.createdAt.$lte = endOfDay(endDate);
         }
 
-        const bills = await Bill.find(billFilter)
-            .sort({ createdAt: 1 })
-            .lean();
+        const [bills, cancelledBills] = await Promise.all([
+            Bill.find(billFilter).sort({ createdAt: 1 }).lean(),
+            includeCancelled
+                ? Bill.find({ ...billFilter, status: 'cancelled', type: 'sale' }).sort({ createdAt: 1 }).lean()
+                : [],
+        ]);
 
         // Build ledger entries
         const ledger = [];
+
+        // Cancelled sales: shown for reference, no effect on the balance
+        for (const bill of cancelledBills) {
+            ledger.push({
+                type: 'cancelled',
+                date: bill.createdAt,
+                description: `Bill #${bill.billNumber} (cancelled)`,
+                billId: bill._id,
+                billNumber: bill.billNumber,
+                items: bill.items,
+                billTotal: bill.total,
+                cancelReason: bill.cancelReason || '',
+                cancelledAt: bill.cancelledAt,
+                debit: 0,
+                credit: 0,
+                notes: bill.notes || ''
+            });
+        }
 
         for (const bill of bills) {
             // Bill entry (debit — customer owes us)
@@ -403,7 +427,7 @@ export const getCustomerLedger = async (req, res) => {
         // Rationale: an initial payment recorded with a bill can have a paidAt slightly
         // before the bill's createdAt, which would incorrectly show the credit before
         // the debit. A bill (liability) must always come before its settlement.
-        const typeOrder = { opening_balance: -1, bill: 0, payment: 1, return: 2 };
+        const typeOrder = { opening_balance: -1, bill: 0, payment: 1, return: 2, cancelled: 3 };
         ledger.sort((a, b) => {
             const dateDiff = new Date(a.date) - new Date(b.date);
             if (Math.abs(dateDiff) > 1000) return dateDiff; // >1s apart → respect real order
@@ -437,7 +461,8 @@ export const getCustomerLedger = async (req, res) => {
                 totalReturns,
                 currentBalance: totalDebit - totalCredit,
                 totalEntries: ledger.length,
-                billCount: bills.length
+                billCount: bills.length,
+                cancelledCount: cancelledBills.length
             }
         });
     } catch (error) {

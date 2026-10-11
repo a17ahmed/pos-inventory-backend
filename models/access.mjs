@@ -21,7 +21,9 @@ const accessSchema = new Schema(
                 // Create/update/delete a customer's special rates
                 saveCustomerRates: { type: Boolean, default: false },
                 // Complete a bill where an item discount exceeds maxDiscountPercent
-                sellBeyondLimit: { type: Boolean, default: false }
+                sellBeyondLimit: { type: Boolean, default: false },
+                // Cancel a completed sale bill (same day only unless admin)
+                cancelBill: { type: Boolean, default: false }
             },
             pendingBills: {
                 view: { type: Boolean, default: true },

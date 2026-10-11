@@ -6,6 +6,7 @@ import Customer from "../models/customer.mjs";
 import Business from "../models/business.mjs";
 import Expense from "../models/expense.mjs";
 import StockMovement from "../models/stockMovement.mjs";
+import CashBook from "../models/cashbook.mjs";
 import { recordCashEntry } from "./cashbook.mjs";
 import { startOfToday, startOfMonth, startOfWeek, endOfDay as endOfDayHelper, startOfDay, toLocalDateString, toLocalTimeString, getTimezone } from "../utils/dateHelpers.mjs";
 import { canViewProfit, hasPosPermission } from "../middleware/accessControl.mjs";
@@ -251,7 +252,7 @@ const restoreStock = async (items, businessId, billRef = {}, session = null) => 
             return {
                 product: i.product,
                 productName: i.name || i.productName || '',
-                type: 'bill_return',
+                type: billRef.type || 'bill_return',
                 quantity: qty,
                 previousStock: (stockMap.get(i.product.toString()) || 0) - qty,
                 newStock: stockMap.get(i.product.toString()) || 0,
@@ -1112,6 +1113,155 @@ export const cancelHoldBill = async (req, res) => {
     } catch (error) {
         console.error("Error cancelling hold bill:", error);
         res.status(500).json({ message: "Failed to cancel hold bill" });
+    }
+};
+
+// Payments recorded within this window of the bill's creation count as paid
+// at the sale; anything later (addPayment, FIFO collection) is a separate,
+// real payment that a cancel must not erase.
+const SALE_PAYMENT_WINDOW_MS = 5 * 60 * 1000;
+
+/**
+ * POST /bills/:id/cancel
+ * Cancel a completed sale that was created by mistake. Unlike a return, the
+ * sale never happened: the bill is marked cancelled (so it drops out of the
+ * customer balance, ledger and all reports), stock is restored, and the cash
+ * it brought into the cashbook is reversed.
+ *
+ * Blocked when the bill has returns, payments received after the sale, or
+ * falls in a closed period. Employees need pos.cancelBill and can only cancel
+ * today's bills; admins can cancel any day.
+ */
+export const cancelSaleBill = async (req, res) => {
+    try {
+        if (!(await hasPosPermission(req, "cancelBill"))) {
+            return res.status(403).json({ message: "You are not allowed to cancel bills" });
+        }
+
+        const reason = (req.body.reason || "").trim();
+        if (!reason) {
+            return res.status(400).json({ message: "A reason is required to cancel a bill" });
+        }
+
+        if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+            return res.status(404).json({ message: "Bill not found" });
+        }
+
+        const session = await mongoose.startSession();
+        let saved;
+        let cashReversed = 0;
+
+        try {
+            session.startTransaction();
+
+            const bill = await Bill.findOne({
+                _id: req.params.id,
+                business: req.user.businessId,
+            }).session(session);
+
+            const reject = async (status, message) => {
+                await session.abortTransaction();
+                // finally block handles session.endSession()
+                return res.status(status).json({ message });
+            };
+
+            if (!bill) return await reject(404, "Bill not found");
+            if (bill.status === "cancelled") return await reject(400, "This bill is already cancelled");
+            if (bill.type !== "sale" || bill.status !== "completed") {
+                return await reject(400, "Only completed sale bills can be cancelled");
+            }
+            if (!req.user.adminId && bill.createdAt < startOfToday()) {
+                return await reject(403, "Only an admin can cancel a bill from a previous day");
+            }
+            if (bill.returns.length > 0) {
+                return await reject(400, "This bill has returns. Cancel the returns first, then cancel the bill.");
+            }
+            const createdAt = bill.createdAt.getTime();
+            if (bill.payments.some((p) => p.paidAt && new Date(p.paidAt).getTime() - createdAt > SALE_PAYMENT_WINDOW_MS)) {
+                return await reject(400, "This bill has payments received after the sale and can't be cancelled");
+            }
+
+            const business = await Business.findById(req.user.businessId)
+                .select("lastClosingAt")
+                .session(session)
+                .lean();
+            if (business?.lastClosingAt && bill.createdAt <= business.lastClosingAt) {
+                return await reject(400, "This bill is in a closed period and can't be cancelled");
+            }
+
+            // Cash this bill actually brought into the cashbook (hold-bill
+            // payments are never recorded there, so read the cashbook itself)
+            const cashEntries = await CashBook.find(
+                {
+                    business: req.user.businessId,
+                    referenceType: "bill",
+                    referenceId: bill._id,
+                    type: "sale_collection",
+                    direction: "in",
+                },
+                { amount: 1 }
+            ).session(session).lean();
+            cashReversed = Math.round(cashEntries.reduce((sum, e) => sum + e.amount, 0) * 100) / 100;
+
+            bill.status = "cancelled";
+            bill.cancelReason = reason;
+            bill.cancelledBy = req.user.id;
+            bill.cancelledAt = new Date();
+
+            // Post-save hook recalculates the customer balance without this bill
+            saved = await bill.save({ session });
+
+            const performedBy = req.user.name || (req.user.adminId ? "Admin" : "Staff");
+
+            await restoreStock(
+                bill.items
+                    .filter((i) => i.product && i.qty - i.returnedQty > 0)
+                    .map((i) => ({ product: i.product, quantity: i.qty - i.returnedQty, name: i.name, price: i.price })),
+                req.user.businessId,
+                {
+                    id: bill._id,
+                    number: `BILL-${bill.billNumber}`,
+                    reason: `Bill cancelled: ${reason}`,
+                    performedBy,
+                    type: "bill_cancel",
+                },
+                session
+            );
+
+            if (cashReversed > 0) {
+                await recordCashEntry({
+                    type: "sale_cancel",
+                    amount: cashReversed,
+                    direction: "out",
+                    referenceType: "bill",
+                    referenceId: bill._id,
+                    referenceNumber: `Bill #${bill.billNumber}`,
+                    description: `Bill cancelled - Bill #${bill.billNumber}`,
+                    note: reason,
+                    performedBy,
+                    performedById: req.user.id,
+                    businessId: req.user.businessId,
+                    session,
+                });
+            }
+
+            await session.commitTransaction();
+        } catch (txError) {
+            await session.abortTransaction();
+            throw txError;
+        } finally {
+            session.endSession();
+        }
+
+        const canSeeProfit = await canViewProfit(req);
+        res.json({
+            message: `Bill #${saved.billNumber} cancelled`,
+            cashReversed,
+            bill: redactProfitFields(saved, canSeeProfit),
+        });
+    } catch (error) {
+        console.error("Error cancelling bill:", error);
+        res.status(500).json({ message: "Failed to cancel bill" });
     }
 };
 

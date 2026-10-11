@@ -6,7 +6,7 @@ import { invalidateAccessCache, getAccessForEmployee } from '../middleware/acces
 // reads skip schema defaults). Fill the pos keys the POS depends on.
 const withPosDefaults = (permissions) => permissions && {
     ...permissions,
-    pos: { saveCustomerRates: false, sellBeyondLimit: false, ...permissions.pos }
+    pos: { saveCustomerRates: false, sellBeyondLimit: false, cancelBill: false, ...permissions.pos }
 };
 
 /**

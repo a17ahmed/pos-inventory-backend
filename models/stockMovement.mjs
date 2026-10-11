@@ -13,7 +13,7 @@ const stockMovementSchema = new Schema(
         },
         type: {
             type: String,
-            enum: ['supply_in', 'supply_update_reverse', 'supply_update_add', 'supply_delete', 'supply_return', 'bill_sold', 'bill_return', 'manual_adjustment'],
+            enum: ['supply_in', 'supply_update_reverse', 'supply_update_add', 'supply_delete', 'supply_return', 'bill_sold', 'bill_return', 'bill_cancel', 'manual_adjustment'],
             required: true
         },
         quantity: {

@@ -175,7 +175,9 @@ const ROUTE_PERMISSIONS = {
             '/hold':      { module: 'pendingBills', action: 'create' },
             '/*/return':  { module: 'returns', action: 'create' },
             '/returns/standalone': { module: 'returns', action: 'standalone' },
-            '/*/payment': { module: 'pos', action: 'create' }
+            '/*/payment': { module: 'pos', action: 'create' },
+            // Checked in the controller against pos.cancelBill
+            '/*/cancel':  null
         },
         PATCH: {
             '/*/resume':              { module: 'pendingBills', action: 'resume' },
