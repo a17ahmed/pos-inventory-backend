@@ -32,7 +32,7 @@
     "xss-clean": "^0.1.4"
   },
   "engines": {
-    "node": "20.x"
+    "node": "24.x"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
