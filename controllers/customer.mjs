@@ -5,6 +5,7 @@ import mongoose from 'mongoose';
 import { recordCashEntry } from './cashbook.mjs';
 import { buildRateEntries, RATE_MESSAGES } from './customerRates.mjs';
 import { hasPosPermission } from '../middleware/accessControl.mjs';
+import { settleCustomerCredit } from '../utils/storeCredit.mjs';
 import { startOfDay, endOfDay, toLocalDateString, toLocalTimeString } from '../utils/dateHelpers.mjs';
 
 // Create or get customer (upsert by phone + business)
@@ -366,6 +367,43 @@ export const getCustomerLedger = async (req, res) => {
             // Payment entries (credit — customer paid us)
             if (bill.payments && bill.payments.length > 0) {
                 for (const payment of bill.payments) {
+                    // Store credit moved here from another bill. The return that
+                    // created the credit already lowered the balance, so it's shown
+                    // as a pair that nets to zero: the credit leaving the source bill
+                    // (debit) and a payment on this bill (credit). Per-bill totals
+                    // stay right (source back to 0, this bill paid down).
+                    if (payment.creditFrom) {
+                        const fromNumber = payment.creditFromBillNumber ?? '';
+                        ledger.push({
+                            type: 'credit_transfer',
+                            date: payment.paidAt,
+                            description: `Credit from Bill #${fromNumber} moved to Bill #${bill.billNumber}`,
+                            billId: payment.creditFrom,
+                            billNumber: payment.creditFromBillNumber,
+                            toBillId: bill._id,
+                            toBillNumber: bill.billNumber,
+                            amount: payment.amount,
+                            debit: payment.amount,
+                            credit: 0,
+                            notes: payment.note || ''
+                        });
+                        ledger.push({
+                            type: 'payment',
+                            date: payment.paidAt,
+                            description: `Payment for Bill #${bill.billNumber} (credit from Bill #${fromNumber})`,
+                            billId: bill._id,
+                            billNumber: bill.billNumber,
+                            fromCredit: true,
+                            fromBillId: payment.creditFrom,
+                            fromBillNumber: payment.creditFromBillNumber,
+                            debit: 0,
+                            credit: payment.amount,
+                            method: 'store_credit',
+                            receivedBy: payment.receivedByName || '',
+                            notes: payment.note || ''
+                        });
+                        continue;
+                    }
                     ledger.push({
                         type: 'payment',
                         date: payment.paidAt,
@@ -427,7 +465,8 @@ export const getCustomerLedger = async (req, res) => {
         // Rationale: an initial payment recorded with a bill can have a paidAt slightly
         // before the bill's createdAt, which would incorrectly show the credit before
         // the debit. A bill (liability) must always come before its settlement.
-        const typeOrder = { opening_balance: -1, bill: 0, payment: 1, return: 2, cancelled: 3 };
+        // credit_transfer (debit) sorts just before its matching payment (credit)
+        const typeOrder = { opening_balance: -1, bill: 0, credit_transfer: 0.5, payment: 1, return: 2, cancelled: 4 };
         ledger.sort((a, b) => {
             const dateDiff = new Date(a.date) - new Date(b.date);
             if (Math.abs(dateDiff) > 1000) return dateDiff; // >1s apart → respect real order
@@ -442,9 +481,12 @@ export const getCustomerLedger = async (req, res) => {
         }
 
         // Summary
-        const totalDebit = ledger.reduce((sum, e) => sum + e.debit, 0);
-        const totalPaid = ledger.filter(e => e.type === 'payment').reduce((sum, e) => sum + e.credit, 0);
+        // Credit moved between bills nets to zero — kept out of billed/paid totals
+        const totalDebit = ledger.filter(e => e.type !== 'credit_transfer').reduce((sum, e) => sum + e.debit, 0);
+        const totalPaid = ledger.filter(e => e.type === 'payment' && !e.fromCredit).reduce((sum, e) => sum + e.credit, 0);
         const totalReturns = ledger.filter(e => e.type === 'return').reduce((sum, e) => sum + e.credit, 0);
+        // Store credit moved between bills (informational — already in totalReturns)
+        const totalCreditApplied = ledger.filter(e => e.type === 'credit_transfer').reduce((sum, e) => sum + e.amount, 0);
         const totalCredit = totalPaid + totalReturns;
 
         res.json({
@@ -461,6 +503,7 @@ export const getCustomerLedger = async (req, res) => {
                 totalReturns,
                 currentBalance: totalDebit - totalCredit,
                 totalEntries: ledger.length,
+                creditApplied: totalCreditApplied,
                 billCount: bills.length,
                 cancelledCount: cancelledBills.length
             }
@@ -479,6 +522,11 @@ export const collectFromCustomer = async (req, res) => {
         if (!payAmount || payAmount <= 0) {
             return res.status(400).json({ message: 'Valid payment amount is required' });
         }
+        if (method === 'store_credit') {
+            return res.status(400).json({
+                message: "Store credit is applied automatically to the customer's unpaid bills. Choose cash, card or online."
+            });
+        }
 
         const customer = await Customer.findOne({
             _id: req.params.id,
@@ -490,41 +538,56 @@ export const collectFromCustomer = async (req, res) => {
             return res.status(404).json({ message: 'Customer not found' });
         }
 
-        // Fetch outstanding bills — oldest first (FIFO)
-        const pendingBills = await Bill.find({
-            customer: customer._id,
-            business: req.user.businessId,
-            status: { $ne: 'cancelled' },
-            paymentStatus: { $in: ['unpaid', 'partial'] }
-        }).sort({ createdAt: 1 });
-
-        if (pendingBills.length === 0) {
-            return res.status(400).json({ message: 'No outstanding bills for this customer' });
-        }
-
-        // Use amountDue (authoritative) — accounts for ledger refunds
-        const totalOutstanding = pendingBills.reduce(
-            (sum, b) => sum + Math.max(0, b.amountDue || 0),
-            0
-        );
-
-        if (payAmount > totalOutstanding + 0.01) {
-            return res.status(400).json({
-                message: `Payment amount (Rs ${payAmount}) exceeds total outstanding (Rs ${totalOutstanding.toFixed(2)})`
-            });
-        }
-
         const receivedByName = req.user.adminId ? 'Admin' : req.user.name || 'Staff';
         const paymentMethod = method || 'cash';
         const paymentNote = note ? `FIFO collection - ${note}` : 'FIFO collection';
 
-        // Distribute payment across bills in a transaction
+        // Settle credit + distribute payment across bills in one transaction
         const session = await mongoose.startSession();
         const allocations = [];
         let remainingToAllocate = payAmount;
+        let totalOutstanding = 0;
+        let creditSettlement = [];
 
         try {
             session.startTransaction();
+
+            const reject = async (message) => {
+                await session.abortTransaction();
+                // finally block handles session.endSession()
+                return res.status(400).json({ message });
+            };
+
+            // Customer credit first pays the oldest bills, so what's left
+            // outstanding equals the balance the ledger shows.
+            creditSettlement = await settleCustomerCredit({
+                customerId: customer._id,
+                businessId: req.user.businessId,
+                session,
+                actor: { id: req.user.id, name: receivedByName },
+            });
+
+            // Fetch outstanding bills — oldest first (FIFO)
+            const pendingBills = await Bill.find({
+                customer: customer._id,
+                business: req.user.businessId,
+                status: { $ne: 'cancelled' },
+                paymentStatus: { $in: ['unpaid', 'partial'] }
+            }).sort({ createdAt: 1 }).session(session);
+
+            if (pendingBills.length === 0) {
+                return await reject('No outstanding bills for this customer');
+            }
+
+            // Use amountDue (authoritative) — accounts for ledger refunds and credit
+            totalOutstanding = pendingBills.reduce(
+                (sum, b) => sum + Math.max(0, b.amountDue || 0),
+                0
+            );
+
+            if (payAmount > totalOutstanding + 0.01) {
+                return await reject(`Payment amount (Rs ${payAmount}) exceeds total outstanding (Rs ${totalOutstanding.toFixed(2)})`);
+            }
 
             for (const bill of pendingBills) {
                 if (remainingToAllocate <= 0) break;
@@ -604,6 +667,7 @@ export const collectFromCustomer = async (req, res) => {
                 receivedByName
             },
             allocations,
+            creditSettlement,   // [{ fromNumber, toNumber, amount }] credit applied before this payment
             summary: {
                 billsAffected: allocations.length,
                 billsFullyPaid: fullyPaid,

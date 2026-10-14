@@ -10,6 +10,7 @@ import CashBook from "../models/cashbook.mjs";
 import { recordCashEntry } from "./cashbook.mjs";
 import { startOfToday, startOfMonth, startOfWeek, endOfDay as endOfDayHelper, startOfDay, toLocalDateString, toLocalTimeString, getTimezone } from "../utils/dateHelpers.mjs";
 import { canViewProfit, hasPosPermission } from "../middleware/accessControl.mjs";
+import { settleCustomerCredit, unwindCreditFrom, releaseCreditOn } from "../utils/storeCredit.mjs";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -272,6 +273,17 @@ const restoreStock = async (items, businessId, billRef = {}, session = null) => 
     }
 };
 
+// Who triggered a store-credit settlement (stored on the credit payment)
+const settlementActor = (req) => ({
+    id: req.user.id,
+    name: req.user.adminId ? "Admin" : (req.user.name || "Staff"),
+});
+
+// Store credit only moves between bills via settlement — a hand-entered
+// store_credit payment would count the customer's credit twice.
+const STORE_CREDIT_MANUAL_MESSAGE =
+    "Store credit is applied automatically to the customer's unpaid bills. Choose cash, card or online.";
+
 /**
  * Generate a return number in the format RET-YYYYMMDD-####
  */
@@ -304,6 +316,11 @@ export const createBill = async (req, res) => {
 
         if (!items || items.length === 0) {
             return res.status(400).json({ message: "Bill must have at least one item" });
+        }
+
+        if (req.body.paymentMethod === "store_credit" ||
+            (Array.isArray(req.body.payments) && req.body.payments.some((p) => p.method === "store_credit"))) {
+            return res.status(400).json({ message: STORE_CREDIT_MANUAL_MESSAGE });
         }
 
         // ── Idempotency guard ──────────────────────────────────────
@@ -601,9 +618,21 @@ export const createBill = async (req, res) => {
                 }
             }
 
+            // Spare customer credit pays unpaid bills (this one included)
+            let result = saved;
+            if (billStatus === "completed" && saved.customer) {
+                const moves = await settleCustomerCredit({
+                    customerId: saved.customer,
+                    businessId: req.user.businessId,
+                    session,
+                    actor: settlementActor(req),
+                });
+                if (moves.length > 0) result = await Bill.findById(saved._id).session(session);
+            }
+
             await session.commitTransaction();
             const canSeeProfit = await canViewProfit(req);
-            res.status(201).json(redactProfitFields(saved, canSeeProfit));
+            res.status(201).json(redactProfitFields(result, canSeeProfit));
         } catch (txError) {
             await session.abortTransaction();
             throw txError;
@@ -793,7 +822,7 @@ export const deleteBill = async (req, res) => {
                     $group: {
                         _id: null,
                         totalBilled: { $sum: "$total" },
-                        totalPaid: { $sum: "$amountPaid" },
+                        totalPaid: { $sum: { $subtract: ["$amountPaid", { $ifNull: ["$creditApplied", 0] }] } },
                         balance: { $sum: "$amountDue" },
                         totalReturns: {
                             $sum: { $cond: [{ $ne: ["$returnStatus", "none"] }, 1, 0] }
@@ -846,6 +875,10 @@ export const holdBill = async (req, res) => {
         const { items } = req.body;
         if (!items || items.length === 0) {
             return res.status(400).json({ message: "Bill must have at least one item" });
+        }
+
+        if (req.body.paymentMethod === "store_credit") {
+            return res.status(400).json({ message: STORE_CREDIT_MANUAL_MESSAGE });
         }
 
         const enrichedItems = normalizeDiscountFields(
@@ -1177,7 +1210,9 @@ export const cancelSaleBill = async (req, res) => {
                 return await reject(400, "This bill has returns. Cancel the returns first, then cancel the bill.");
             }
             const createdAt = bill.createdAt.getTime();
-            if (bill.payments.some((p) => p.paidAt && new Date(p.paidAt).getTime() - createdAt > SALE_PAYMENT_WINDOW_MS)) {
+            // Store credit moved onto this bill isn't money received — it's
+            // given back to its source bill below, so it doesn't block.
+            if (bill.payments.some((p) => !p.creditFrom && p.paidAt && new Date(p.paidAt).getTime() - createdAt > SALE_PAYMENT_WINDOW_MS)) {
                 return await reject(400, "This bill has payments received after the sale and can't be cancelled");
             }
 
@@ -1203,6 +1238,9 @@ export const cancelSaleBill = async (req, res) => {
             ).session(session).lean();
             cashReversed = Math.round(cashEntries.reduce((sum, e) => sum + e.amount, 0) * 100) / 100;
 
+            // Credit that paid this bill goes back to the bill it came from
+            const creditReleased = await releaseCreditOn(bill, session);
+
             bill.status = "cancelled";
             bill.cancelReason = reason;
             bill.cancelledBy = req.user.id;
@@ -1210,6 +1248,16 @@ export const cancelSaleBill = async (req, res) => {
 
             // Post-save hook recalculates the customer balance without this bill
             saved = await bill.save({ session });
+
+            // Released credit pays the customer's other unpaid bills
+            if (creditReleased > 0 && bill.customer) {
+                await settleCustomerCredit({
+                    customerId: bill.customer,
+                    businessId: req.user.businessId,
+                    session,
+                    actor: settlementActor(req),
+                });
+            }
 
             const performedBy = req.user.name || (req.user.adminId ? "Admin" : "Staff");
 
@@ -1301,6 +1349,7 @@ export const processReturn = async (req, res) => {
         let cashRefundAmount = 0;
         let debtCancelled = 0;
         let refundMethod;
+        let creditSettlement = [];
 
         try {
             session.startTransaction();
@@ -1486,6 +1535,19 @@ export const processReturn = async (req, res) => {
                 });
             }
 
+            // Credit left on a customer bill pays their oldest unpaid bills
+            if (isCustomerBill) {
+                creditSettlement = await settleCustomerCredit({
+                    customerId: bill.customer,
+                    businessId: req.user.businessId,
+                    session,
+                    actor: settlementActor(req),
+                });
+                if (creditSettlement.length > 0) {
+                    saved = await Bill.findById(bill._id).session(session);
+                }
+            }
+
             await session.commitTransaction();
         } catch (txError) {
             await session.abortTransaction();
@@ -1501,6 +1563,7 @@ export const processReturn = async (req, res) => {
             refundAmount: totalRefundAmount,   // full value of returned items (for ledger/reporting)
             cashRefundAmount,                   // actual cash handed back to customer
             debtCancelled,                      // unpaid portion written off (0 for fully-paid bills)
+            creditSettlement,                   // [{ fromNumber, toNumber, amount }] credit moved to unpaid bills
             bill: redactProfitFields(saved, canSeeProfit),
         });
     } catch (error) {
@@ -1692,6 +1755,10 @@ export const cancelReturn = async (req, res) => {
                 return res.status(404).json({ message: "Return entry not found" });
             }
 
+            // Take back any credit this bill already passed to other bills;
+            // whatever credit is left after the cancel is settled again below.
+            await unwindCreditFrom(bill, session);
+
             // Restore item returnedQty on the bill
             for (const returnItem of returnEntry.items) {
                 const billItem = returnItem.product
@@ -1726,6 +1793,17 @@ export const cancelReturn = async (req, res) => {
                 performedBy: req.user.name || 'Staff'
             }, session);
             saved = await bill.save({ session });
+
+            if (bill.customer) {
+                const moves = await settleCustomerCredit({
+                    customerId: bill.customer,
+                    businessId: req.user.businessId,
+                    session,
+                    actor: settlementActor(req),
+                });
+                if (moves.length > 0) saved = await Bill.findById(bill._id).session(session);
+            }
+
             await session.commitTransaction();
         } catch (txError) {
             await session.abortTransaction();
@@ -2445,47 +2523,77 @@ export const getTopProducts = async (req, res) => {
  * Add a payment entry to an existing bill's payments[].
  * If fully paid, the pre-save hook sets paymentStatus to "paid".
  * For hold bills that become fully paid, auto-complete the bill.
+ * On a completed customer bill, available store credit is settled first and
+ * the payment can't exceed what's still due.
  */
 export const addPayment = async (req, res) => {
     try {
-        const bill = await Bill.findOne({
-            _id: req.params.id,
-            business: req.user.businessId,
-        });
-
-        if (!bill) return res.status(404).json({ message: "Bill not found" });
-
-        if (bill.status === "cancelled") {
-            return res.status(400).json({ message: "Cannot add payment to a cancelled bill" });
-        }
-
         const { amount, method, note, reference } = req.body;
 
         if (!amount || amount <= 0) {
             return res.status(400).json({ message: "Payment amount must be greater than 0" });
         }
-
-        bill.payments.push({
-            amount: parseFloat(amount),
-            method: method || "cash",
-            paidAt: new Date(),
-            receivedBy: req.user.id,
-            receivedByName: req.user.adminId ? "Admin" : (req.user.name || "Staff"),
-            note: note || "",
-            reference: reference || "",
-        });
-
-        // If this is a hold bill and total payments >= total, auto-complete
-        const newTotal = bill.payments.reduce((sum, p) => sum + p.amount, 0);
-        const shouldComplete = bill.status === "hold" && newTotal >= bill.total;
-        if (shouldComplete) {
-            bill.status = "completed";
+        if (method === "store_credit") {
+            return res.status(400).json({ message: STORE_CREDIT_MANUAL_MESSAGE });
         }
 
-        // Use transaction so bill save + stock deduction are atomic
+        // Use transaction so credit settlement + bill save + stock deduction are atomic
         const session = await mongoose.startSession();
         try {
             session.startTransaction();
+
+            const reject = async (status, body) => {
+                await session.abortTransaction();
+                // finally block handles session.endSession()
+                return res.status(status).json(body);
+            };
+
+            let bill = await Bill.findOne({
+                _id: req.params.id,
+                business: req.user.businessId,
+            }).session(session);
+
+            if (!bill) return await reject(404, { message: "Bill not found" });
+
+            if (bill.status === "cancelled") {
+                return await reject(400, { message: "Cannot add payment to a cancelled bill" });
+            }
+
+            // Customer credit may already cover (part of) this bill
+            if (bill.status === "completed" && bill.customer) {
+                const moves = await settleCustomerCredit({
+                    customerId: bill.customer,
+                    businessId: req.user.businessId,
+                    session,
+                    actor: settlementActor(req),
+                });
+                if (moves.length > 0) bill = await Bill.findById(bill._id).session(session);
+
+                if (parseFloat(amount) > Math.max(0, bill.amountDue) + 0.01) {
+                    return await reject(400, {
+                        message: bill.amountDue > 0.005
+                            ? `Payment exceeds the amount due on this bill (Rs ${Math.round(bill.amountDue * 100) / 100})`
+                            : "This bill has nothing left to pay",
+                    });
+                }
+            }
+
+            bill.payments.push({
+                amount: parseFloat(amount),
+                method: method || "cash",
+                paidAt: new Date(),
+                receivedBy: req.user.id,
+                receivedByName: req.user.adminId ? "Admin" : (req.user.name || "Staff"),
+                note: note || "",
+                reference: reference || "",
+            });
+
+            // If this is a hold bill and total payments >= total, auto-complete
+            const newTotal = bill.payments.reduce((sum, p) => sum + p.amount, 0);
+            const shouldComplete = bill.status === "hold" && newTotal >= bill.total;
+            if (shouldComplete) {
+                bill.status = "completed";
+            }
 
             // ── Stock validation when auto-completing a hold bill ────
             if (shouldComplete) {
@@ -2516,9 +2624,7 @@ export const addPayment = async (req, res) => {
                     }
 
                     if (outOfStock.length > 0) {
-                        await session.abortTransaction();
-                        // finally block handles session.endSession()
-                        return res.status(400).json({
+                        return await reject(400, {
                             message: "Insufficient stock to complete this bill",
                             outOfStock,
                         });
@@ -3185,7 +3291,8 @@ export const customerSalesReport = async (req, res) => {
                     customerName: { $first: "$customerName" },
                     customerPhone: { $first: "$customerPhone" },
                     totalSpent: { $sum: "$total" },
-                    totalPaid: { $sum: "$amountPaid" },
+                    // Real money only — store credit moved between bills excluded
+                    totalPaid: { $sum: { $subtract: ["$amountPaid", { $ifNull: ["$creditApplied", 0] }] } },
                     totalDiscount: { $sum: "$totalDiscount" },
                     totalRefunded: { $sum: "$totalRefunded" },
                     billCount: { $sum: 1 },
