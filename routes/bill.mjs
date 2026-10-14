@@ -4,6 +4,7 @@ import {
     createBillSchema,
     holdBillSchema,
     cancelHoldBillSchema,
+    cancelSaleBillSchema,
     processReturnSchema,
     standaloneRefundSchema,
     addPaymentSchema,
@@ -19,6 +20,7 @@ import {
     getHoldBills,
     resumeHoldBill,
     cancelHoldBill,
+    cancelSaleBill,
     processReturn,
     getReturns,
     getBillForReturn,
@@ -71,6 +73,9 @@ billRouter.get("/returns/product/:productId", lookupBillsByProduct);
 billRouter.post("/returns/standalone", validate(standaloneRefundSchema), createStandaloneRefund);
 billRouter.post("/:id/return", validate(processReturnSchema), processReturn);
 billRouter.patch("/:id/return/:returnId/cancel", cancelReturn);
+
+// ─── Cancel a completed sale (mistaken bill) ─────────────────
+billRouter.post("/:id/cancel", validate(cancelSaleBillSchema), cancelSaleBill);
 
 // ─── Payments ────────────────────────────────────────────────
 billRouter.post("/:id/payment", validate(addPaymentSchema), addPayment);

@@ -14,6 +14,8 @@ const cashbookSchema = new Schema({
             'vendor_payment',
             'customer_refund',
             'expense',
+            // Cash from a completed sale reversed because the bill was cancelled
+            'sale_cancel',
         ],
         required: true,
     },

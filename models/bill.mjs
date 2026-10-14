@@ -51,6 +51,12 @@ const billItemSchema = new Schema({
 
     // Per-item discount (flat ₹ off, frontend converts % to flat before sending)
     discountAmount: { type: Number, default: 0 },
+    // Where the discount came from. 'customerRate' = the customer's saved special rate
+    discountSource: { type: String, enum: ["manual", "customerRate"], default: "manual" },
+    // The special rate (per unit) that was applied, for audit/reports
+    customerRate: { type: Number, default: null },
+    // true = cashier chose to sell beyond the product's maxDiscountPercent cap
+    limitOverride: { type: Boolean, default: false },
 
     itemTotal: { type: Number, default: 0 },
     itemProfit: { type: Number, default: 0 },
@@ -149,10 +155,32 @@ const billSchema = new Schema(
             receivedBy: { type: Schema.Types.ObjectId, ref: "Employee", default: null },
             receivedByName: { type: String, default: "" },
             note: { type: String, default: "" },
-            reference: { type: String, default: "" }
+            reference: { type: String, default: "" },
+            // Set when this "payment" is customer credit moved here from
+            // another bill (see utils/storeCredit.mjs) — not real money.
+            creditFrom: { type: Schema.Types.ObjectId, ref: "Bill", default: null },
+            creditFromBillNumber: { type: Number, default: null },
+            settlementBatch: { type: String, default: "" }
         }],
         amountPaid: { type: Number, default: 0 },
         amountDue: { type: Number, default: 0 },
+
+        // Store credit (customer bills). A bill whose due went below zero (a
+        // return after payment) is a credit SOURCE; settlement moves that
+        // credit onto the customer's unpaid bills as store_credit payments.
+        //   creditTransfers — where this bill's credit went (source side)
+        //   creditUsed      — Σ creditTransfers.amount, added back to amountDue
+        //   creditApplied   — Σ credit payments received (target side)
+        creditTransfers: [{
+            toBill: { type: Schema.Types.ObjectId, ref: "Bill", required: true },
+            toBillNumber: { type: Number, default: null },
+            paymentId: { type: Schema.Types.ObjectId, required: true },
+            amount: { type: Number, required: true },
+            at: { type: Date, default: Date.now },
+            batch: { type: String, default: "" }
+        }],
+        creditUsed: { type: Number, default: 0 },
+        creditApplied: { type: Number, default: 0 },
         cashGiven: { type: Number, default: 0 },
         change: { type: Number, default: 0 },
         idempotencyKey: { type: String },
@@ -257,6 +285,7 @@ billSchema.pre("save", function (next) {
         this.totalRefunded = 0;
         this.netAmount = this.total;
         this.amountPaid = this.payments.reduce((sum, p) => sum + p.amount, 0);
+        this.creditApplied = this.payments.reduce((sum, p) => sum + (p.creditFrom ? p.amount : 0), 0);
         this.amountDue = this.total - this.amountPaid;
         if (this.amountPaid <= 0) {
             this.paymentStatus = "unpaid";
@@ -350,6 +379,8 @@ billSchema.pre("save", function (next) {
 
     // ── Payments ───────────────────────────────────────────────
     this.amountPaid = this.payments.reduce((sum, p) => sum + p.amount, 0);
+    this.creditApplied = this.payments.reduce((sum, p) => sum + (p.creditFrom ? p.amount : 0), 0);
+    this.creditUsed = (this.creditTransfers || []).reduce((sum, t) => sum + t.amount, 0);
 
     // Effective total customer must settle (after ledger-only refunds)
     const effectiveTotal = Math.max(0, this.total - this.totalLedgerRefunded);
@@ -367,7 +398,8 @@ billSchema.pre("save", function (next) {
     // fully paying the bill) and represents store credit owed TO the customer.
     // The post-save hook aggregates amountDue across all their bills so the
     // customer-level balance naturally reflects both debt (+) and credit (-).
-    this.amountDue = effectiveTotal - this.amountPaid;
+    // Credit this bill passed on to other bills is no longer available here.
+    this.amountDue = effectiveTotal - this.amountPaid + this.creditUsed;
     this.change = this.cashGiven - this.total;
     if (this.change < 0) this.change = 0;
 
@@ -405,7 +437,8 @@ billSchema.post("save", async function () {
             $group: {
                 _id: null,
                 totalBilled: { $sum: "$total" },
-                totalPaid: { $sum: "$amountPaid" },
+                // Real money only — credit moved between bills isn't a payment
+                totalPaid: { $sum: { $subtract: ["$amountPaid", { $ifNull: ["$creditApplied", 0] }] } },
                 totalLedgerRefunded: { $sum: "$totalLedgerRefunded" },
                 balance: { $sum: "$amountDue" },
                 totalReturns: {

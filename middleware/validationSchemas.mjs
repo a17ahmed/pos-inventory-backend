@@ -127,6 +127,7 @@ export const updateBusinessSettingsSchema = Joi.object({
         enableDeals: Joi.boolean(),
         requireTableForDineIn: Joi.boolean(),
         autoSendToKitchen: Joi.boolean(),
+        allowSellBelowCost: Joi.boolean(),
     }),
     cashTaxRate: Joi.number().min(0).max(100),
     cardTaxRate: Joi.number().min(0).max(100),
@@ -275,6 +276,17 @@ export const bulkUpdateStockSchema = Joi.object({
 // CUSTOMER
 // ═══════════════════════════════════════════════════════════════
 
+// One special rate in a request body. `rate` is range-checked in the
+// controller (it depends on the product's selling price) so the error message
+// matches the API contract; `priceWhenSaved` is accepted but always ignored —
+// the server sets it from the product.
+const specialRateInputSchema = Joi.object({
+    product: objectId.required(),
+    rate: Joi.any().required(),
+    note: Joi.string().max(200).allow(""),
+    priceWhenSaved: Joi.any(),
+});
+
 export const createCustomerSchema = Joi.object({
     name: Joi.string().required(),
     phone: Joi.string().required(),
@@ -282,6 +294,7 @@ export const createCustomerSchema = Joi.object({
     address: Joi.string().allow(""),
     notes: Joi.string().allow(""),
     openingBalance: Joi.number().min(0),
+    specialRates: Joi.array().items(specialRateInputSchema),
 });
 
 export const updateCustomerSchema = Joi.object({
@@ -293,6 +306,18 @@ export const updateCustomerSchema = Joi.object({
     isActive: Joi.boolean(),
     creditDays: Joi.number().min(0),
     creditLimit: Joi.number().min(0),
+    // Accepted but ignored — rates are edited via /customer/:id/rates only
+    specialRates: Joi.any(),
+});
+
+export const upsertCustomerRateSchema = Joi.object({
+    rate: Joi.any().required(),
+    note: Joi.string().max(200).allow(""),
+    priceWhenSaved: Joi.any(),
+});
+
+export const replaceCustomerRatesSchema = Joi.object({
+    rates: Joi.array().items(specialRateInputSchema).required(),
 });
 
 export const collectFromCustomerSchema = Joi.object({
@@ -416,6 +441,9 @@ const billItemSchema = Joi.object({
     costPrice: Joi.number().min(0),
     gst: Joi.number().min(0),
     discountAmount: Joi.number().min(0),
+    discountSource: Joi.string().valid("manual", "customerRate"),
+    customerRate: Joi.number().min(0).allow(null),
+    limitOverride: Joi.boolean(),
 });
 
 const billPaymentSchema = Joi.object({
@@ -459,23 +487,36 @@ export const holdBillSchema = Joi.object({
     notes: Joi.string().allow(""),
 });
 
+// Cancel a completed sale. `reason` is required — checked in the controller
+// so the message is readable.
+export const cancelSaleBillSchema = Joi.object({
+    reason: Joi.string().allow("").max(300),
+});
+
 export const cancelHoldBillSchema = Joi.object({
     cancelReason: Joi.string().allow(""),
     refundOnCancel: Joi.number().min(0),
 });
 
+const returnReason = Joi.string().valid("defective", "wrong_item", "changed_mind", "expired", "damaged", "other");
+
+// Either `items` (specific quantities) or `fullReturn: true` (everything still
+// on the bill). The either/or rule is enforced in processReturn so the message
+// is readable.
 export const processReturnSchema = Joi.object({
     items: Joi.array()
         .items(
             Joi.object({
                 itemId: objectId.required(),
                 quantity: Joi.number().integer().positive().required(),
-                reason: Joi.string().valid("defective", "wrong_item", "changed_mind", "expired", "damaged", "other"),
+                reason: returnReason,
                 reasonNote: Joi.string().allow(""),
             })
-        )
-        .min(1)
-        .required(),
+        ),
+    fullReturn: Joi.boolean(),
+    // Used for every item when fullReturn is true
+    reason: returnReason,
+    reasonNote: Joi.string().allow(""),
     notes: Joi.string().allow(""),
 });
 

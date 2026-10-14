@@ -2,6 +2,13 @@ import Access from '../models/access.mjs';
 import Employee from '../models/employee.mjs';
 import { invalidateAccessCache, getAccessForEmployee } from '../middleware/accessControl.mjs';
 
+// Access docs created before a permission key existed don't store it (lean
+// reads skip schema defaults). Fill the pos keys the POS depends on.
+const withPosDefaults = (permissions) => permissions && {
+    ...permissions,
+    pos: { saveCustomerRates: false, sellBeyondLimit: false, cancelBill: false, ...permissions.pos }
+};
+
 /**
  * GET /access/me
  * Get the calling user's own permissions.
@@ -29,7 +36,7 @@ export const getMyAccess = async (req, res) => {
             invalidateAccessCache(req.user.id, req.user.businessId);
         }
 
-        res.json({ permissions });
+        res.json({ permissions: withPosDefaults(permissions) });
     } catch (error) {
         console.error('Error fetching my access:', error);
         res.status(500).json({ message: 'Failed to fetch permissions' });
@@ -74,7 +81,7 @@ export const getEmployeeAccess = async (req, res) => {
             access = access.toObject();
         }
 
-        res.json({ employee, access });
+        res.json({ employee, access: { ...access, permissions: withPosDefaults(access.permissions) } });
     } catch (error) {
         console.error('Error fetching access:', error);
         res.status(500).json({ message: 'Failed to fetch employee access' });

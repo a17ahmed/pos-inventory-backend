@@ -3,11 +3,14 @@ import Bill from "../models/bill.mjs";
 import Counter from "../models/counter.mjs";
 import Product from "../models/product.mjs";
 import Customer from "../models/customer.mjs";
+import Business from "../models/business.mjs";
 import Expense from "../models/expense.mjs";
 import StockMovement from "../models/stockMovement.mjs";
+import CashBook from "../models/cashbook.mjs";
 import { recordCashEntry } from "./cashbook.mjs";
 import { startOfToday, startOfMonth, startOfWeek, endOfDay as endOfDayHelper, startOfDay, toLocalDateString, toLocalTimeString, getTimezone } from "../utils/dateHelpers.mjs";
-import { canViewProfit } from "../middleware/accessControl.mjs";
+import { canViewProfit, hasPosPermission } from "../middleware/accessControl.mjs";
+import { settleCustomerCredit, unwindCreditFrom, releaseCreditOn } from "../utils/storeCredit.mjs";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -96,13 +99,36 @@ const enrichItemsWithCost = async (items, businessId) => {
 };
 
 /**
- * Validate every line item's discountAmount against its product's cost-price
- * floor and optional maxDiscountPercent cap. Returns { error, capTotal } --
- * error is a user-facing message (or null if all items pass), capTotal is
- * the sum of each item's individually allowed cap (used for the whole-bill
- * discount check).
+ * Normalise the special-rate fields on bill items. discountSource
+ * 'customerRate' is only kept when the bill has a customer; absent fields get
+ * the old-client defaults ('manual', null, false).
  */
-const validateDiscountLimits = (enrichedItems) => {
+const normalizeDiscountFields = (items, hasCustomer) =>
+    items.map((item) => {
+        const fromRate = item.discountSource === "customerRate" && hasCustomer;
+        return {
+            ...item,
+            discountSource: fromRate ? "customerRate" : "manual",
+            customerRate: fromRate && item.customerRate != null ? item.customerRate : null,
+            limitOverride: item.limitOverride === true,
+        };
+    });
+
+/**
+ * Validate every line item's discountAmount. Returns { error, capTotal } --
+ * error is a user-facing message (or null if all items pass), capTotal is
+ * the sum of each item's allowed cap (used for the whole-bill discount check).
+ *
+ * Per line:
+ *   - discount can never exceed the line total (price * qty)
+ *   - cap = maxDiscountPercent of the line PROFIT, or the full profit when no
+ *     percent is set (same as the POS's getItemDiscountCap), so the price
+ *     never goes below cost
+ *   - limitOverride lines (permission checked by the caller) skip the percent
+ *     cap; they may only go below cost when the business setting
+ *     allowSellBelowCost is on
+ */
+const validateDiscountLimits = (enrichedItems, { allowSellBelowCost = false } = {}) => {
     let capTotal = 0;
 
     for (const item of enrichedItems) {
@@ -111,15 +137,24 @@ const validateDiscountLimits = (enrichedItems) => {
         const discountAmount = item.discountAmount || 0;
         const costPrice = item.costPrice || 0;
 
-        const hardFloorCap = lineGross - costPrice * qty;
+        if (discountAmount > lineGross + 0.01) {
+            return { error: `Discount on ${item.name} exceeds the item total`, capTotal };
+        }
+
+        const profitCap = Math.max(0, lineGross - costPrice * qty);
         const percentCap = item.maxDiscountPercent != null
-            ? (lineGross * item.maxDiscountPercent) / 100
-            : Infinity;
+            ? (profitCap * item.maxDiscountPercent) / 100
+            : profitCap;
+        capTotal += percentCap;
 
-        const effectiveCap = Math.max(0, Math.min(hardFloorCap, percentCap));
-        capTotal += effectiveCap;
+        if (item.limitOverride) {
+            if (!allowSellBelowCost && discountAmount > profitCap + 0.01) {
+                return { error: `Cannot sell ${item.name} below cost price`, capTotal };
+            }
+            continue;
+        }
 
-        if (discountAmount > effectiveCap + 0.01) {
+        if (discountAmount > percentCap + 0.01) {
             return { error: `Discount on ${item.name} exceeds the allowed limit`, capTotal };
         }
     }
@@ -218,7 +253,7 @@ const restoreStock = async (items, businessId, billRef = {}, session = null) => 
             return {
                 product: i.product,
                 productName: i.name || i.productName || '',
-                type: 'bill_return',
+                type: billRef.type || 'bill_return',
                 quantity: qty,
                 previousStock: (stockMap.get(i.product.toString()) || 0) - qty,
                 newStock: stockMap.get(i.product.toString()) || 0,
@@ -237,6 +272,17 @@ const restoreStock = async (items, businessId, billRef = {}, session = null) => 
         console.error("Stock restoration failed:", err.message);
     }
 };
+
+// Who triggered a store-credit settlement (stored on the credit payment)
+const settlementActor = (req) => ({
+    id: req.user.id,
+    name: req.user.adminId ? "Admin" : (req.user.name || "Staff"),
+});
+
+// Store credit only moves between bills via settlement — a hand-entered
+// store_credit payment would count the customer's credit twice.
+const STORE_CREDIT_MANUAL_MESSAGE =
+    "Store credit is applied automatically to the customer's unpaid bills. Choose cash, card or online.";
 
 /**
  * Generate a return number in the format RET-YYYYMMDD-####
@@ -272,6 +318,11 @@ export const createBill = async (req, res) => {
             return res.status(400).json({ message: "Bill must have at least one item" });
         }
 
+        if (req.body.paymentMethod === "store_credit" ||
+            (Array.isArray(req.body.payments) && req.body.payments.some((p) => p.method === "store_credit"))) {
+            return res.status(400).json({ message: STORE_CREDIT_MANUAL_MESSAGE });
+        }
+
         // ── Idempotency guard ──────────────────────────────────────
         if (idempotencyKey) {
             const existing = await Bill.findOne({
@@ -290,7 +341,10 @@ export const createBill = async (req, res) => {
         const billStatus = status === "hold" ? "hold" : "completed";
 
         // ── Enrich items with costPrice ────────────────────────────
-        const enrichedItems = await enrichItemsWithCost(items, req.user.businessId);
+        const enrichedItems = normalizeDiscountFields(
+            await enrichItemsWithCost(items, req.user.businessId),
+            !!req.body.customer
+        );
 
         const now = new Date();
 
@@ -319,8 +373,21 @@ export const createBill = async (req, res) => {
             });
         }
 
+        // ── Selling beyond the discount cap needs pos.sellBeyondLimit ──
+        let allowSellBelowCost = false;
+        if (enrichedItems.some((i) => i.limitOverride)) {
+            if (!(await hasPosPermission(req, "sellBeyondLimit"))) {
+                return res.status(403).json({ message: "You are not allowed to sell beyond the discount limit" });
+            }
+            const business = await Business.findById(req.user.businessId)
+                .select("settings.allowSellBelowCost")
+                .lean();
+            allowSellBelowCost = business?.settings?.allowSellBelowCost === true;
+        }
+
         // ── Discount cap validation: cost-price floor + optional per-product max% ──
-        const { error: discountCapError, capTotal: allowedDiscountCapTotal } = validateDiscountLimits(enrichedItems);
+        const { error: discountCapError, capTotal: allowedDiscountCapTotal } =
+            validateDiscountLimits(enrichedItems, { allowSellBelowCost });
         if (discountCapError) {
             return res.status(400).json({ message: discountCapError });
         }
@@ -551,9 +618,21 @@ export const createBill = async (req, res) => {
                 }
             }
 
+            // Spare customer credit pays unpaid bills (this one included)
+            let result = saved;
+            if (billStatus === "completed" && saved.customer) {
+                const moves = await settleCustomerCredit({
+                    customerId: saved.customer,
+                    businessId: req.user.businessId,
+                    session,
+                    actor: settlementActor(req),
+                });
+                if (moves.length > 0) result = await Bill.findById(saved._id).session(session);
+            }
+
             await session.commitTransaction();
             const canSeeProfit = await canViewProfit(req);
-            res.status(201).json(redactProfitFields(saved, canSeeProfit));
+            res.status(201).json(redactProfitFields(result, canSeeProfit));
         } catch (txError) {
             await session.abortTransaction();
             throw txError;
@@ -743,7 +822,7 @@ export const deleteBill = async (req, res) => {
                     $group: {
                         _id: null,
                         totalBilled: { $sum: "$total" },
-                        totalPaid: { $sum: "$amountPaid" },
+                        totalPaid: { $sum: { $subtract: ["$amountPaid", { $ifNull: ["$creditApplied", 0] }] } },
                         balance: { $sum: "$amountDue" },
                         totalReturns: {
                             $sum: { $cond: [{ $ne: ["$returnStatus", "none"] }, 1, 0] }
@@ -798,7 +877,14 @@ export const holdBill = async (req, res) => {
             return res.status(400).json({ message: "Bill must have at least one item" });
         }
 
-        const enrichedItems = await enrichItemsWithCost(items, req.user.businessId);
+        if (req.body.paymentMethod === "store_credit") {
+            return res.status(400).json({ message: STORE_CREDIT_MANUAL_MESSAGE });
+        }
+
+        const enrichedItems = normalizeDiscountFields(
+            await enrichItemsWithCost(items, req.user.businessId),
+            !!req.body.customer
+        );
         const now = new Date();
 
         // Build payment if partial payment was made
@@ -1063,6 +1149,170 @@ export const cancelHoldBill = async (req, res) => {
     }
 };
 
+// Payments recorded within this window of the bill's creation count as paid
+// at the sale; anything later (addPayment, FIFO collection) is a separate,
+// real payment that a cancel must not erase.
+const SALE_PAYMENT_WINDOW_MS = 5 * 60 * 1000;
+
+/**
+ * POST /bills/:id/cancel
+ * Cancel a completed sale that was created by mistake. Unlike a return, the
+ * sale never happened: the bill is marked cancelled (so it drops out of the
+ * customer balance, ledger and all reports), stock is restored, and the cash
+ * it brought into the cashbook is reversed.
+ *
+ * Blocked when the bill has returns, payments received after the sale, or
+ * falls in a closed period. Employees need pos.cancelBill and can only cancel
+ * today's bills; admins can cancel any day.
+ */
+export const cancelSaleBill = async (req, res) => {
+    try {
+        if (!(await hasPosPermission(req, "cancelBill"))) {
+            return res.status(403).json({ message: "You are not allowed to cancel bills" });
+        }
+
+        const reason = (req.body.reason || "").trim();
+        if (!reason) {
+            return res.status(400).json({ message: "A reason is required to cancel a bill" });
+        }
+
+        if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+            return res.status(404).json({ message: "Bill not found" });
+        }
+
+        const session = await mongoose.startSession();
+        let saved;
+        let cashReversed = 0;
+
+        try {
+            session.startTransaction();
+
+            const bill = await Bill.findOne({
+                _id: req.params.id,
+                business: req.user.businessId,
+            }).session(session);
+
+            const reject = async (status, message) => {
+                await session.abortTransaction();
+                // finally block handles session.endSession()
+                return res.status(status).json({ message });
+            };
+
+            if (!bill) return await reject(404, "Bill not found");
+            if (bill.status === "cancelled") return await reject(400, "This bill is already cancelled");
+            if (bill.type !== "sale" || bill.status !== "completed") {
+                return await reject(400, "Only completed sale bills can be cancelled");
+            }
+            if (!req.user.adminId && bill.createdAt < startOfToday()) {
+                return await reject(403, "Only an admin can cancel a bill from a previous day");
+            }
+            if (bill.returns.length > 0) {
+                return await reject(400, "This bill has returns. Cancel the returns first, then cancel the bill.");
+            }
+            const createdAt = bill.createdAt.getTime();
+            // Store credit moved onto this bill isn't money received — it's
+            // given back to its source bill below, so it doesn't block.
+            if (bill.payments.some((p) => !p.creditFrom && p.paidAt && new Date(p.paidAt).getTime() - createdAt > SALE_PAYMENT_WINDOW_MS)) {
+                return await reject(400, "This bill has payments received after the sale and can't be cancelled");
+            }
+
+            const business = await Business.findById(req.user.businessId)
+                .select("lastClosingAt")
+                .session(session)
+                .lean();
+            if (business?.lastClosingAt && bill.createdAt <= business.lastClosingAt) {
+                return await reject(400, "This bill is in a closed period and can't be cancelled");
+            }
+
+            // Cash this bill actually brought into the cashbook (hold-bill
+            // payments are never recorded there, so read the cashbook itself)
+            const cashEntries = await CashBook.find(
+                {
+                    business: req.user.businessId,
+                    referenceType: "bill",
+                    referenceId: bill._id,
+                    type: "sale_collection",
+                    direction: "in",
+                },
+                { amount: 1 }
+            ).session(session).lean();
+            cashReversed = Math.round(cashEntries.reduce((sum, e) => sum + e.amount, 0) * 100) / 100;
+
+            // Credit that paid this bill goes back to the bill it came from
+            const creditReleased = await releaseCreditOn(bill, session);
+
+            bill.status = "cancelled";
+            bill.cancelReason = reason;
+            bill.cancelledBy = req.user.id;
+            bill.cancelledAt = new Date();
+
+            // Post-save hook recalculates the customer balance without this bill
+            saved = await bill.save({ session });
+
+            // Released credit pays the customer's other unpaid bills
+            if (creditReleased > 0 && bill.customer) {
+                await settleCustomerCredit({
+                    customerId: bill.customer,
+                    businessId: req.user.businessId,
+                    session,
+                    actor: settlementActor(req),
+                });
+            }
+
+            const performedBy = req.user.name || (req.user.adminId ? "Admin" : "Staff");
+
+            await restoreStock(
+                bill.items
+                    .filter((i) => i.product && i.qty - i.returnedQty > 0)
+                    .map((i) => ({ product: i.product, quantity: i.qty - i.returnedQty, name: i.name, price: i.price })),
+                req.user.businessId,
+                {
+                    id: bill._id,
+                    number: `BILL-${bill.billNumber}`,
+                    reason: `Bill cancelled: ${reason}`,
+                    performedBy,
+                    type: "bill_cancel",
+                },
+                session
+            );
+
+            if (cashReversed > 0) {
+                await recordCashEntry({
+                    type: "sale_cancel",
+                    amount: cashReversed,
+                    direction: "out",
+                    referenceType: "bill",
+                    referenceId: bill._id,
+                    referenceNumber: `Bill #${bill.billNumber}`,
+                    description: `Bill cancelled - Bill #${bill.billNumber}`,
+                    note: reason,
+                    performedBy,
+                    performedById: req.user.id,
+                    businessId: req.user.businessId,
+                    session,
+                });
+            }
+
+            await session.commitTransaction();
+        } catch (txError) {
+            await session.abortTransaction();
+            throw txError;
+        } finally {
+            session.endSession();
+        }
+
+        const canSeeProfit = await canViewProfit(req);
+        res.json({
+            message: `Bill #${saved.billNumber} cancelled`,
+            cashReversed,
+            bill: redactProfitFields(saved, canSeeProfit),
+        });
+    } catch (error) {
+        console.error("Error cancelling bill:", error);
+        res.status(500).json({ message: "Failed to cancel bill" });
+    }
+};
+
 // ═══════════════════════════════════════════════════════════════════════════
 // RETURNS
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1072,12 +1322,20 @@ export const cancelHoldBill = async (req, res) => {
  * Process a return against an existing completed bill.
  * Adds an entry to bill.returns[], updates item returnedQty, restores stock.
  * The post-save hook handles customer ledger sync.
+ *
+ * Body: either { items: [{ itemId, quantity, reason, reasonNote }] } or
+ * { fullReturn: true, reason, reasonNote } — the latter returns every item's
+ * remaining quantity (so on a partially-returned bill only what's left).
  */
 export const processReturn = async (req, res) => {
     try {
-        const { items } = req.body;
+        const { items, fullReturn } = req.body;
+        const hasItems = Array.isArray(items) && items.length > 0;
 
-        if (!items || items.length === 0) {
+        if (fullReturn === true && hasItems) {
+            return res.status(400).json({ message: "Send either items or fullReturn, not both" });
+        }
+        if (fullReturn !== true && !hasItems) {
             return res.status(400).json({ message: "No items to return" });
         }
 
@@ -1091,6 +1349,7 @@ export const processReturn = async (req, res) => {
         let cashRefundAmount = 0;
         let debtCancelled = 0;
         let refundMethod;
+        let creditSettlement = [];
 
         try {
             session.startTransaction();
@@ -1115,8 +1374,27 @@ export const processReturn = async (req, res) => {
             const isCustomerBill = !!bill.customer;
             refundMethod = isCustomerBill ? "ledger_adjust" : "cash";
 
+            // Full return: every item's remaining quantity, one shared reason
+            let returnLines = items;
+            if (fullReturn === true) {
+                returnLines = bill.items
+                    .filter((i) => i.qty - i.returnedQty > 0)
+                    .map((i) => ({
+                        itemId: i._id.toString(),
+                        quantity: i.qty - i.returnedQty,
+                        reason: req.body.reason,
+                        reasonNote: req.body.reasonNote,
+                    }));
+
+                if (returnLines.length === 0) {
+                    await session.abortTransaction();
+                    session.endSession();
+                    return res.status(400).json({ message: "This bill has already been fully returned" });
+                }
+            }
+
             // Validate return quantities don't exceed remaining
-            for (const returnItem of items) {
+            for (const returnItem of returnLines) {
                 const billItem = bill.items.id(returnItem.itemId);
                 if (!billItem) {
                     await session.abortTransaction();
@@ -1143,7 +1421,7 @@ export const processReturn = async (req, res) => {
             let totalProfitLost = 0;
             const returnItems = [];
 
-            for (const returnItem of items) {
+            for (const returnItem of returnLines) {
                 const billItem = bill.items.id(returnItem.itemId);
 
                 const itemTax = (billItem.gst || 0) * billItem.qty;
@@ -1172,6 +1450,25 @@ export const processReturn = async (req, res) => {
                 billItem.returnedQty += returnItem.quantity;
             }
 
+            // Last return on the bill: refund exactly what's left of the total,
+            // so per-item rounding across several returns can't refund a paisa
+            // more or less than the customer was billed. The difference goes on
+            // the last returned item so item refunds still add up.
+            if (bill.items.every((i) => i.returnedQty >= i.qty)) {
+                const alreadyRefunded = bill.returns.reduce((sum, r) => sum + (r.refundAmount || 0), 0);
+                const remainingRefund = Math.round(((bill.total || 0) - alreadyRefunded) * 100) / 100;
+                const adjustment = Math.round((remainingRefund - totalRefundAmount) * 100) / 100;
+
+                // Only correct rounding drift, never a real difference
+                if (adjustment !== 0 && Math.abs(adjustment) < 1) {
+                    const lastItem = returnItems[returnItems.length - 1];
+                    lastItem.refundAmount = Math.round((lastItem.refundAmount + adjustment) * 100) / 100;
+                    lastItem.profitLost = Math.round((lastItem.profitLost + adjustment) * 100) / 100;
+                    totalRefundAmount = remainingRefund;
+                    totalProfitLost = Math.round((totalProfitLost + adjustment) * 100) / 100;
+                }
+            }
+
             // For partially-paid bills: only return what was actually received.
             // paidRatio is the fraction of the bill total that has been paid.
             // - ledger_adjust (customer bills): the formula amountDue = effectiveTotal - amountPaid
@@ -1189,7 +1486,7 @@ export const processReturn = async (req, res) => {
             }
 
             // Restore stock for returned items
-            const stockItems = items
+            const stockItems = returnLines
                 .map((ri) => {
                     const billItem = bill.items.id(ri.itemId);
                     return billItem?.product
@@ -1238,6 +1535,19 @@ export const processReturn = async (req, res) => {
                 });
             }
 
+            // Credit left on a customer bill pays their oldest unpaid bills
+            if (isCustomerBill) {
+                creditSettlement = await settleCustomerCredit({
+                    customerId: bill.customer,
+                    businessId: req.user.businessId,
+                    session,
+                    actor: settlementActor(req),
+                });
+                if (creditSettlement.length > 0) {
+                    saved = await Bill.findById(bill._id).session(session);
+                }
+            }
+
             await session.commitTransaction();
         } catch (txError) {
             await session.abortTransaction();
@@ -1253,6 +1563,7 @@ export const processReturn = async (req, res) => {
             refundAmount: totalRefundAmount,   // full value of returned items (for ledger/reporting)
             cashRefundAmount,                   // actual cash handed back to customer
             debtCancelled,                      // unpaid portion written off (0 for fully-paid bills)
+            creditSettlement,                   // [{ fromNumber, toNumber, amount }] credit moved to unpaid bills
             bill: redactProfitFields(saved, canSeeProfit),
         });
     } catch (error) {
@@ -1444,6 +1755,10 @@ export const cancelReturn = async (req, res) => {
                 return res.status(404).json({ message: "Return entry not found" });
             }
 
+            // Take back any credit this bill already passed to other bills;
+            // whatever credit is left after the cancel is settled again below.
+            await unwindCreditFrom(bill, session);
+
             // Restore item returnedQty on the bill
             for (const returnItem of returnEntry.items) {
                 const billItem = returnItem.product
@@ -1478,6 +1793,17 @@ export const cancelReturn = async (req, res) => {
                 performedBy: req.user.name || 'Staff'
             }, session);
             saved = await bill.save({ session });
+
+            if (bill.customer) {
+                const moves = await settleCustomerCredit({
+                    customerId: bill.customer,
+                    businessId: req.user.businessId,
+                    session,
+                    actor: settlementActor(req),
+                });
+                if (moves.length > 0) saved = await Bill.findById(bill._id).session(session);
+            }
+
             await session.commitTransaction();
         } catch (txError) {
             await session.abortTransaction();
@@ -2197,47 +2523,77 @@ export const getTopProducts = async (req, res) => {
  * Add a payment entry to an existing bill's payments[].
  * If fully paid, the pre-save hook sets paymentStatus to "paid".
  * For hold bills that become fully paid, auto-complete the bill.
+ * On a completed customer bill, available store credit is settled first and
+ * the payment can't exceed what's still due.
  */
 export const addPayment = async (req, res) => {
     try {
-        const bill = await Bill.findOne({
-            _id: req.params.id,
-            business: req.user.businessId,
-        });
-
-        if (!bill) return res.status(404).json({ message: "Bill not found" });
-
-        if (bill.status === "cancelled") {
-            return res.status(400).json({ message: "Cannot add payment to a cancelled bill" });
-        }
-
         const { amount, method, note, reference } = req.body;
 
         if (!amount || amount <= 0) {
             return res.status(400).json({ message: "Payment amount must be greater than 0" });
         }
-
-        bill.payments.push({
-            amount: parseFloat(amount),
-            method: method || "cash",
-            paidAt: new Date(),
-            receivedBy: req.user.id,
-            receivedByName: req.user.adminId ? "Admin" : (req.user.name || "Staff"),
-            note: note || "",
-            reference: reference || "",
-        });
-
-        // If this is a hold bill and total payments >= total, auto-complete
-        const newTotal = bill.payments.reduce((sum, p) => sum + p.amount, 0);
-        const shouldComplete = bill.status === "hold" && newTotal >= bill.total;
-        if (shouldComplete) {
-            bill.status = "completed";
+        if (method === "store_credit") {
+            return res.status(400).json({ message: STORE_CREDIT_MANUAL_MESSAGE });
         }
 
-        // Use transaction so bill save + stock deduction are atomic
+        // Use transaction so credit settlement + bill save + stock deduction are atomic
         const session = await mongoose.startSession();
         try {
             session.startTransaction();
+
+            const reject = async (status, body) => {
+                await session.abortTransaction();
+                // finally block handles session.endSession()
+                return res.status(status).json(body);
+            };
+
+            let bill = await Bill.findOne({
+                _id: req.params.id,
+                business: req.user.businessId,
+            }).session(session);
+
+            if (!bill) return await reject(404, { message: "Bill not found" });
+
+            if (bill.status === "cancelled") {
+                return await reject(400, { message: "Cannot add payment to a cancelled bill" });
+            }
+
+            // Customer credit may already cover (part of) this bill
+            if (bill.status === "completed" && bill.customer) {
+                const moves = await settleCustomerCredit({
+                    customerId: bill.customer,
+                    businessId: req.user.businessId,
+                    session,
+                    actor: settlementActor(req),
+                });
+                if (moves.length > 0) bill = await Bill.findById(bill._id).session(session);
+
+                if (parseFloat(amount) > Math.max(0, bill.amountDue) + 0.01) {
+                    return await reject(400, {
+                        message: bill.amountDue > 0.005
+                            ? `Payment exceeds the amount due on this bill (Rs ${Math.round(bill.amountDue * 100) / 100})`
+                            : "This bill has nothing left to pay",
+                    });
+                }
+            }
+
+            bill.payments.push({
+                amount: parseFloat(amount),
+                method: method || "cash",
+                paidAt: new Date(),
+                receivedBy: req.user.id,
+                receivedByName: req.user.adminId ? "Admin" : (req.user.name || "Staff"),
+                note: note || "",
+                reference: reference || "",
+            });
+
+            // If this is a hold bill and total payments >= total, auto-complete
+            const newTotal = bill.payments.reduce((sum, p) => sum + p.amount, 0);
+            const shouldComplete = bill.status === "hold" && newTotal >= bill.total;
+            if (shouldComplete) {
+                bill.status = "completed";
+            }
 
             // ── Stock validation when auto-completing a hold bill ────
             if (shouldComplete) {
@@ -2268,9 +2624,7 @@ export const addPayment = async (req, res) => {
                     }
 
                     if (outOfStock.length > 0) {
-                        await session.abortTransaction();
-                        // finally block handles session.endSession()
-                        return res.status(400).json({
+                        return await reject(400, {
                             message: "Insufficient stock to complete this bill",
                             outOfStock,
                         });
@@ -2937,7 +3291,8 @@ export const customerSalesReport = async (req, res) => {
                     customerName: { $first: "$customerName" },
                     customerPhone: { $first: "$customerPhone" },
                     totalSpent: { $sum: "$total" },
-                    totalPaid: { $sum: "$amountPaid" },
+                    // Real money only — store credit moved between bills excluded
+                    totalPaid: { $sum: { $subtract: ["$amountPaid", { $ifNull: ["$creditApplied", 0] }] } },
                     totalDiscount: { $sum: "$totalDiscount" },
                     totalRefunded: { $sum: "$totalRefunded" },
                     billCount: { $sum: 1 },

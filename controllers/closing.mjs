@@ -97,6 +97,8 @@ export const computeClosing = async (businessId, periodStart, periodEnd, session
                 Bill.aggregate([
                     { $match: { ...commonMatch, customer: { $ne: null }, createdAt: { $lt: periodStart } } },
                     { $unwind: "$payments" },
+                    // Store credit moved between bills isn't money collected
+                    { $match: { "payments.creditFrom": null } },
                     {
                         $addFields: {
                             effectivePaidAt: { $cond: [{ $lt: ["$payments.paidAt", "$createdAt"] }, "$createdAt", "$payments.paidAt"] },
@@ -139,12 +141,23 @@ export const computeClosing = async (businessId, periodStart, periodEnd, session
                                     },
                                 },
                             },
+                            // Credit this bill passed to other bills: those bills count it
+                            // as paid, so add it back here or it would be counted twice.
+                            creditUsedToDate: {
+                                $sum: {
+                                    $map: {
+                                        input: { $filter: { input: { $ifNull: ["$creditTransfers", []] }, as: "t", cond: { $lte: ["$$t.at", periodEnd] } } },
+                                        as: "t",
+                                        in: "$$t.amount",
+                                    },
+                                },
+                            },
                         },
                     },
                     {
                         $group: {
                             _id: null,
-                            outstanding: { $sum: { $subtract: ["$total", { $add: ["$paidToDate", "$ledgerRefundToDate"] }] } },
+                            outstanding: { $sum: { $add: [{ $subtract: ["$total", { $add: ["$paidToDate", "$ledgerRefundToDate"] }] }, "$creditUsedToDate"] } },
                         },
                     },
                 ]).session(session),
