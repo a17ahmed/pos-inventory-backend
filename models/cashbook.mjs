@@ -16,6 +16,8 @@ const cashbookSchema = new Schema({
             'expense',
             // Cash from a completed sale reversed because the bill was cancelled
             'sale_cancel',
+            // Cash expense deleted — the money comes back into the drawer
+            'expense_reversal',
         ],
         required: true,
     },

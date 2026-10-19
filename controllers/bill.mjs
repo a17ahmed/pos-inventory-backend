@@ -2505,9 +2505,14 @@ export const computeTopProducts = async (rawBusinessId, limit = 12) => {
 
 export const getTopProducts = async (req, res) => {
     try {
-        const limit = parseInt(req.query.limit) || 12;
-        const result = await computeTopProducts(req.user.businessId, limit);
-        res.json(result);
+        const limit = Math.min(Math.max(parseInt(req.query.limit) || 12, 1), 50);
+        const [result, showProfit] = await Promise.all([
+            computeTopProducts(req.user.businessId, limit),
+            canViewProfit(req),
+        ]);
+        // Counter users without pos.viewProfit get no profit field at all
+        // (not 0). totalRevenue stays — it's sales, not cost data.
+        res.json(showProfit ? result : result.map(({ totalProfit, ...rest }) => rest));
     } catch (error) {
         console.error("Error fetching top products:", error);
         res.status(500).json({ message: "Failed to fetch top products" });

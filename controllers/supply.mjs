@@ -8,6 +8,10 @@ import { cloudinary } from '../middleware/upload.mjs';
 import CashBook from '../models/cashbook.mjs';
 import { recordCashEntry } from './cashbook.mjs';
 import { startOfDay, endOfDay } from '../utils/dateHelpers.mjs';
+import { settleVendorCredit, SUPPLY_BALANCE_EXPR, SUPPLY_REAL_PAID_EXPR } from '../utils/vendorCredit.mjs';
+
+// Who triggered a vendor-credit settlement (stored on the credit payment)
+const creditActor = (req) => ({ name: req.user.adminId ? 'Admin' : req.user.name || 'Staff' });
 
 // Helper: log stock movements in bulk
 // When session is provided (inside transaction), errors propagate to trigger abort.
@@ -91,19 +95,20 @@ const createSupply = async (req, res) => {
 
         const calculatedTotal = processedItems.reduce((sum, item) => sum + item.total, 0);
 
-        // Credit limit validation
+        // Paying more than the bill would turn cash into vendor credit
+        if ((Number(paidAmount) || 0) > calculatedTotal + 0.005) {
+            return res.status(400).json({
+                message: `Paid amount (Rs ${Number(paidAmount)}) can't be more than the supply total (Rs ${calculatedTotal})`
+            });
+        }
+
+        // Credit limit validation (net of any credit the vendor owes us)
         if (vendorDoc.creditLimit > 0) {
-            const outstanding = await Supply.aggregate([
-                {
-                    $match: {
-                        vendor: vendorDoc._id,
-                        business: new mongoose.Types.ObjectId(req.user.businessId),
-                        paymentStatus: { $nin: ['paid', 'returned'] }
-                    }
-                },
-                { $group: { _id: null, totalRemaining: { $sum: '$remainingAmount' } } }
+            const [net] = await Supply.aggregate([
+                { $match: { vendor: vendorDoc._id, business: new mongoose.Types.ObjectId(req.user.businessId) } },
+                { $group: { _id: null, net: { $sum: SUPPLY_BALANCE_EXPR } } }
             ]);
-            const currentOutstanding = outstanding[0]?.totalRemaining || 0;
+            const currentOutstanding = Math.round((net?.net || 0) * 100) / 100;
             const newRemaining = calculatedTotal - (Number(paidAmount) || 0);
             if (currentOutstanding + newRemaining > vendorDoc.creditLimit) {
                 return res.status(400).json({
@@ -144,6 +149,22 @@ const createSupply = async (req, res) => {
         let supply;
         try {
             session.startTransaction();
+
+            // Cash paid now must actually be in the drawer (same rule as Pay)
+            if (initialPaid > 0 && supplyPayMethod === 'cash') {
+                const latest = await CashBook.findOne({ business: req.user.businessId })
+                    .sort({ createdAt: -1, entryNumber: -1 })
+                    .select('runningBalance')
+                    .session(session)
+                    .lean();
+                const cashBalance = latest?.runningBalance ?? 0;
+                if (initialPaid > cashBalance) {
+                    await session.abortTransaction();
+                    return res.status(400).json({
+                        message: `Insufficient cash in hand. Available: Rs ${cashBalance.toLocaleString()}, Required: Rs ${initialPaid.toLocaleString()}`
+                    });
+                }
+            }
 
             const supplyNumber = await Counter.getNextSequence('supplyNumber', req.user.businessId, session);
 
@@ -210,6 +231,15 @@ const createSupply = async (req, res) => {
                     session,
                 });
             }
+
+            // Credit the vendor owes us (from an earlier return) pays this supply
+            const creditMoves = await settleVendorCredit({
+                vendorId: supply.vendor,
+                businessId: req.user.businessId,
+                session,
+                actor: creditActor(req),
+            });
+            if (creditMoves.length > 0) supply = await Supply.findById(supply._id).session(session);
 
             await session.commitTransaction();
         } catch (txError) {
@@ -286,6 +316,23 @@ const getSupply = async (req, res) => {
     }
 };
 
+// True when the incoming items match the saved ones (product, qty, price, and
+// GST when it is sent), in any order.
+const sameItems = (saved, incoming) => {
+    if (saved.length !== incoming.length) return false;
+    const key = (product, qty, price) => `${product}|${Number(qty)}|${Number(price)}`;
+    const left = saved.map(i => ({ k: key(i.product, i.quantity, i.unitPrice), gst: i.gst || 0 }));
+    for (const item of incoming) {
+        const idx = left.findIndex(l =>
+            l.k === key(item.product, item.quantity, item.unitPrice) &&
+            (item.gst === undefined || Number(item.gst) === l.gst)
+        );
+        if (idx === -1) return false;
+        left.splice(idx, 1);
+    }
+    return true;
+};
+
 // Update supply
 const updateSupply = async (req, res) => {
     try {
@@ -304,10 +351,28 @@ const updateSupply = async (req, res) => {
             items = JSON.parse(items);
         }
 
+        // Paid amount comes only from recorded payments (Pay), so the ledger,
+        // the supply and the cash book always agree. An unchanged value from
+        // the edit form is ignored.
+        if (paidAmount !== undefined && Math.abs(Number(paidAmount) - (supply.paidAmount || 0)) > 0.005) {
+            return res.status(400).json({ message: 'Paid amount can\'t be edited. Use "Pay" to record a payment.' });
+        }
+
+        // The edit form always re-sends every item. Same items as saved → treat
+        // as no item change (no stock churn, and allowed after a return).
+        if (items && items.length > 0 && sameItems(supply.items, items)) {
+            items = undefined;
+        }
+
+        // Changing items after a return would wipe the returned quantities and
+        // put back stock that already went to the vendor.
+        if (items && items.length > 0 && (supply.returns || []).length > 0) {
+            return res.status(400).json({ message: 'This supply has returns, so its items can\'t be changed. Undo the returns first.' });
+        }
+
         if (billNumber !== undefined) supply.billNumber = billNumber;
         if (billDate !== undefined) supply.billDate = billDate;
         if (notes !== undefined) supply.notes = notes;
-        if (paidAmount !== undefined) supply.paidAmount = Number(paidAmount);
 
         // Track old image for cleanup after successful commit
         let oldImageToDelete = null;
@@ -318,6 +383,7 @@ const updateSupply = async (req, res) => {
             supply.receiptImage = req.file.path;
         }
 
+        let result = supply;
         if (items && items.length > 0) {
             const productIds = items.map(item => item.product).filter(Boolean);
             if (productIds.length !== items.length) {
@@ -378,10 +444,40 @@ const updateSupply = async (req, res) => {
                     }
                 }));
 
+            // Net stock change per product (new qty − old qty). A cut can't take
+            // back more than is still on the shelf (same rule as a return).
+            const netByProduct = new Map();
+            for (const i of oldItems) {
+                const key = i.product.toString();
+                netByProduct.set(key, (netByProduct.get(key) || 0) - i.quantity);
+            }
+            for (const i of newItems.filter(i => i.product)) {
+                const key = i.product.toString();
+                netByProduct.set(key, (netByProduct.get(key) || 0) + i.quantity);
+            }
+            const cutIds = [...netByProduct].filter(([, net]) => net < 0).map(([id]) => id);
+
             // ── Transaction: reverse old stock → add new stock → save supply ──
             const session = await mongoose.startSession();
             try {
                 session.startTransaction();
+
+                if (cutIds.length > 0) {
+                    const liveProducts = await Product.find(
+                        { _id: { $in: cutIds }, business: req.user.businessId, trackStock: true },
+                        { name: 1, stockQuantity: 1 }
+                    ).session(session).lean();
+                    const outOfStock = liveProducts
+                        .filter(p => p.stockQuantity < -netByProduct.get(p._id.toString()))
+                        .map(p => ({ productId: p._id, name: p.name, requested: -netByProduct.get(p._id.toString()), available: p.stockQuantity }));
+                    if (outOfStock.length > 0) {
+                        await session.abortTransaction();
+                        return res.status(400).json({
+                            message: 'Some of these items were already sold, so the quantity can\'t be reduced that much',
+                            outOfStock
+                        });
+                    }
+                }
 
                 if (reverseOps.length > 0) {
                     await Product.bulkWrite(reverseOps, { session });
@@ -432,6 +528,16 @@ const updateSupply = async (req, res) => {
                 }
 
                 await supply.save({ session });
+
+                // A lower total can leave the supply overpaid → vendor credit
+                const moves = await settleVendorCredit({
+                    vendorId: supply.vendor,
+                    businessId: req.user.businessId,
+                    session,
+                    actor: creditActor(req),
+                });
+                if (moves.length > 0) result = await Supply.findById(supply._id).session(session);
+
                 await session.commitTransaction();
             } catch (txError) {
                 await session.abortTransaction();
@@ -450,7 +556,7 @@ const updateSupply = async (req, res) => {
             cloudinary.uploader.destroy(publicId).catch(() => {});
         }
 
-        res.json(supply);
+        res.json(result);
     } catch (error) {
         console.error('[Supply]', error);
         res.status(500).json({ message: 'Internal server error' });
@@ -466,63 +572,70 @@ const recordPayment = async (req, res) => {
             return res.status(400).json({ message: 'Valid payment amount is required' });
         }
 
-        const supply = await Supply.findOne({
-            _id: req.params.id,
-            business: req.user.businessId
-        });
-
-        if (!supply) {
-            return res.status(404).json({ message: 'Supply not found' });
-        }
-
-        if (supply.paymentStatus === 'paid') {
-            return res.status(400).json({ message: 'This supply is already fully paid' });
-        }
-
-        if (supply.paymentStatus === 'returned') {
-            return res.status(400).json({ message: 'This supply has been fully returned. No payment needed.' });
-        }
-
-        if (Number(amount) > supply.remainingAmount) {
-            return res.status(400).json({
-                message: `Payment amount cannot exceed remaining balance of Rs ${supply.remainingAmount}`
-            });
-        }
-
         const paymentMethod = method || 'cash';
         const payAmount = Number(amount);
-
-        // Cash balance check
-        if (paymentMethod === 'cash') {
-            const latest = await CashBook.findOne({ business: req.user.businessId })
-                .sort({ createdAt: -1, entryNumber: -1 })
-                .select('runningBalance')
-                .lean();
-            const cashBalance = latest?.runningBalance ?? 0;
-            if (payAmount > cashBalance) {
-                return res.status(400).json({
-                    message: `Insufficient cash in hand. Available: Rs ${cashBalance.toLocaleString()}, Required: Rs ${payAmount.toLocaleString()}`,
-                });
-            }
-        }
-
         const paidBy = req.user.adminId ? 'Admin' : req.user.name || '';
 
-        supply.payments.push({
-            amount: payAmount,
-            method: paymentMethod,
-            paidAt: new Date(),
-            paidBy,
-            note: note || '',
-            reference: reference || ''
-        });
+        const session = await mongoose.startSession();
+        try {
+            session.startTransaction();
 
-        // Use transaction for cash payments (supply + cashbook must be atomic)
-        if (paymentMethod === 'cash') {
-            const session = await mongoose.startSession();
-            try {
-                session.startTransaction();
-                await supply.save({ session });
+            const reject = async (status, message) => {
+                await session.abortTransaction();
+                // finally block handles session.endSession()
+                return res.status(status).json({ message });
+            };
+
+            let supply = await Supply.findOne({
+                _id: req.params.id,
+                business: req.user.businessId
+            }).session(session);
+
+            if (!supply) return await reject(404, 'Supply not found');
+
+            // Credit the vendor owes us may already cover (part of) this supply
+            const moves = await settleVendorCredit({
+                vendorId: supply.vendor,
+                businessId: req.user.businessId,
+                session,
+                actor: creditActor(req),
+            });
+            if (moves.length > 0) supply = await Supply.findById(supply._id).session(session);
+
+            if (supply.paymentStatus === 'returned') {
+                return await reject(400, 'This supply has been fully returned. No payment needed.');
+            }
+            if (supply.paymentStatus === 'paid' || supply.remainingAmount <= 0.005) {
+                return await reject(400, 'This supply is already fully paid');
+            }
+            if (payAmount > supply.remainingAmount + 0.005) {
+                return await reject(400, `Payment amount cannot exceed remaining balance of Rs ${supply.remainingAmount}`);
+            }
+
+            // Cash balance check
+            if (paymentMethod === 'cash') {
+                const latest = await CashBook.findOne({ business: req.user.businessId })
+                    .sort({ createdAt: -1, entryNumber: -1 })
+                    .select('runningBalance')
+                    .session(session)
+                    .lean();
+                const cashBalance = latest?.runningBalance ?? 0;
+                if (payAmount > cashBalance) {
+                    return await reject(400, `Insufficient cash in hand. Available: Rs ${cashBalance.toLocaleString()}, Required: Rs ${payAmount.toLocaleString()}`);
+                }
+            }
+
+            supply.payments.push({
+                amount: payAmount,
+                method: paymentMethod,
+                paidAt: new Date(),
+                paidBy,
+                note: note || '',
+                reference: reference || ''
+            });
+            await supply.save({ session });
+
+            if (paymentMethod === 'cash') {
                 await recordCashEntry({
                     type: 'vendor_payment',
                     amount: payAmount,
@@ -537,18 +650,16 @@ const recordPayment = async (req, res) => {
                     businessId: req.user.businessId,
                     session,
                 });
-                await session.commitTransaction();
-            } catch (txError) {
-                await session.abortTransaction();
-                throw txError;
-            } finally {
-                session.endSession();
             }
-        } else {
-            await supply.save();
-        }
 
-        res.json(supply);
+            await session.commitTransaction();
+            res.json(supply);
+        } catch (txError) {
+            await session.abortTransaction();
+            throw txError;
+        } finally {
+            session.endSession();
+        }
     } catch (error) {
         console.error('[Supply]', error);
         res.status(500).json({ message: 'Internal server error' });
@@ -567,10 +678,16 @@ const deleteSupply = async (req, res) => {
             return res.status(404).json({ message: 'Supply not found' });
         }
 
-        // Delete receipt image from Cloudinary if exists (outside transaction — external service)
-        if (supply.receiptImage) {
-            const publicId = supply.receiptImage.split('/').slice(-2).join('/').split('.')[0];
-            await cloudinary.uploader.destroy(publicId).catch(() => {});
+        // A supply with payments, returns or moved vendor credit is part of the
+        // vendor's ledger and the cash book — deleting it would leave them wrong.
+        if ((supply.payments || []).length > 0) {
+            return res.status(400).json({ message: 'This supply has payments, so it can\'t be deleted.' });
+        }
+        if ((supply.returns || []).length > 0) {
+            return res.status(400).json({ message: 'This supply has returns, so it can\'t be deleted.' });
+        }
+        if ((supply.creditTransfers || []).length > 0) {
+            return res.status(400).json({ message: 'This supply\'s credit was used on other supplies, so it can\'t be deleted.' });
         }
 
         // ── Reverse stock that was added by this supply ─────────
@@ -587,6 +704,27 @@ const deleteSupply = async (req, res) => {
             session.startTransaction();
 
             if (reverseOps.length > 0) {
+                // Same rule as a return: can't take back stock that was already sold
+                const needByProduct = new Map();
+                for (const i of deleteItems) {
+                    const key = i.product.toString();
+                    needByProduct.set(key, (needByProduct.get(key) || 0) + i.quantity);
+                }
+                const liveProducts = await Product.find(
+                    { _id: { $in: [...needByProduct.keys()] }, business: req.user.businessId, trackStock: true },
+                    { name: 1, stockQuantity: 1 }
+                ).session(session).lean();
+                const outOfStock = liveProducts
+                    .filter(p => p.stockQuantity < needByProduct.get(p._id.toString()))
+                    .map(p => ({ productId: p._id, name: p.name, requested: needByProduct.get(p._id.toString()), available: p.stockQuantity }));
+                if (outOfStock.length > 0) {
+                    await session.abortTransaction();
+                    return res.status(400).json({
+                        message: 'Some items from this supply were already sold, so it can\'t be deleted',
+                        outOfStock
+                    });
+                }
+
                 await Product.bulkWrite(reverseOps, { session });
                 const deletedProducts = await Product.find(
                     { _id: { $in: deleteItems.map(i => i.product) }, business: req.user.businessId },
@@ -610,27 +748,6 @@ const deleteSupply = async (req, res) => {
                 })), session);
             }
 
-            // Reverse cashbook entries for cash payments
-            const cashTotal = supply.payments
-                .filter(p => p.method === 'cash')
-                .reduce((sum, p) => sum + p.amount, 0);
-            if (cashTotal > 0) {
-                await recordCashEntry({
-                    type: 'vendor_payment_reversal',
-                    amount: cashTotal,
-                    direction: 'in',
-                    referenceType: 'supply',
-                    referenceId: supply._id,
-                    referenceNumber: `Supply #${supply.supplyNumber}`,
-                    description: `Reversed: Supply #${supply.supplyNumber} deleted`,
-                    note: 'Supply deleted',
-                    performedBy: req.user.adminId ? 'Admin' : req.user.name || '',
-                    performedById: req.user.id,
-                    businessId: req.user.businessId,
-                    session,
-                });
-            }
-
             await Supply.deleteOne({ _id: supply._id }, { session });
             await session.commitTransaction();
         } catch (txError) {
@@ -638,6 +755,12 @@ const deleteSupply = async (req, res) => {
             throw txError;
         } finally {
             session.endSession();
+        }
+
+        // Delete receipt image from Cloudinary (external service — only after the delete committed)
+        if (supply.receiptImage) {
+            const publicId = supply.receiptImage.split('/').slice(-2).join('/').split('.')[0];
+            await cloudinary.uploader.destroy(publicId).catch(() => {});
         }
 
         res.json({ message: 'Supply deleted successfully' });
@@ -667,7 +790,7 @@ const computeSupplyStats = async (rawBusinessId) => {
                     $group: {
                         _id: null,
                         totalAmount: { $sum: '$totalAmount' },
-                        totalPaid: { $sum: '$paidAmount' },
+                        totalPaid: { $sum: SUPPLY_REAL_PAID_EXPR },
                         totalRemaining: { $sum: '$remainingAmount' },
                         count: { $sum: 1 }
                     }
@@ -680,7 +803,7 @@ const computeSupplyStats = async (rawBusinessId) => {
                     $group: {
                         _id: null,
                         totalAmount: { $sum: '$totalAmount' },
-                        totalPaid: { $sum: '$paidAmount' },
+                        totalPaid: { $sum: SUPPLY_REAL_PAID_EXPR },
                         totalRemaining: { $sum: '$remainingAmount' },
                         count: { $sum: 1 }
                     }
@@ -705,7 +828,7 @@ const computeSupplyStats = async (rawBusinessId) => {
                         _id: '$vendor',
                         vendorName: { $first: '$vendorName' },
                         totalAmount: { $sum: '$totalAmount' },
-                        totalPaid: { $sum: '$paidAmount' },
+                        totalPaid: { $sum: SUPPLY_REAL_PAID_EXPR },
                         totalRemaining: { $sum: '$remainingAmount' },
                         count: { $sum: 1 }
                     }
@@ -834,6 +957,8 @@ const processSupplyReturn = async (req, res) => {
         }));
 
         // pre-save hook recalculates totalReturned, remainingAmount, paymentStatus
+        let result = supply;
+        let creditSettlement = [];
         const session = await mongoose.startSession();
         try {
             session.startTransaction();
@@ -904,6 +1029,16 @@ const processSupplyReturn = async (req, res) => {
                 })), session);
             }
 
+            // Returning goods on a paid supply leaves the vendor owing us —
+            // that credit pays this vendor's oldest unpaid supplies.
+            creditSettlement = await settleVendorCredit({
+                vendorId: supply.vendor,
+                businessId: req.user.businessId,
+                session,
+                actor: creditActor(req),
+            });
+            if (creditSettlement.length > 0) result = await Supply.findById(supply._id).session(session);
+
             await session.commitTransaction();
         } catch (txError) {
             await session.abortTransaction();
@@ -916,7 +1051,8 @@ const processSupplyReturn = async (req, res) => {
             message: 'Return processed successfully',
             returnedItems: returnItems,
             totalRefund,
-            supply
+            creditSettlement,   // [{ fromNumber, toNumber, amount }] credit applied to other supplies
+            supply: result
         });
     } catch (error) {
         console.error('[Supply]', error);

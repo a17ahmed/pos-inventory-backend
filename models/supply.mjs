@@ -93,14 +93,38 @@ const supplySchema = new Schema(
             amount: { type: Number, required: true },
             method: {
                 type: String,
-                enum: ['cash', 'card', 'bank_transfer', 'cheque', 'other'],
+                // vendor_credit = credit moved here from another supply (not money)
+                enum: ['cash', 'card', 'bank_transfer', 'cheque', 'online', 'other', 'vendor_credit'],
                 default: 'cash'
             },
             paidAt: { type: Date, default: Date.now },
             paidBy: { type: String, default: '' },
             note: { type: String, default: '' },
-            reference: { type: String, default: '' }
+            reference: { type: String, default: '' },
+            // Set when this "payment" is vendor credit moved from another
+            // supply (see utils/vendorCredit.mjs)
+            creditFrom: { type: Schema.Types.ObjectId, ref: 'Supply', default: null },
+            creditFromSupplyNumber: { type: Number, default: null },
+            settlementBatch: { type: String, default: '' }
         }],
+
+        // Vendor credit. A supply returned after being paid can be overpaid —
+        // the vendor owes us. `balance` keeps the signed amount (negative =
+        // vendor credit); remainingAmount stays the >= 0 "we still owe" figure.
+        //   creditTransfers — where this supply's credit went (source side)
+        //   creditUsed      — Σ creditTransfers.amount, added back to balance
+        //   creditApplied   — Σ credit payments received (target side)
+        balance: { type: Number, default: 0 },
+        creditTransfers: [{
+            toSupply: { type: Schema.Types.ObjectId, ref: 'Supply', required: true },
+            toSupplyNumber: { type: Number, default: null },
+            paymentId: { type: Schema.Types.ObjectId, required: true },
+            amount: { type: Number, required: true },
+            at: { type: Date, default: Date.now },
+            batch: { type: String, default: '' }
+        }],
+        creditUsed: { type: Number, default: 0 },
+        creditApplied: { type: Number, default: 0 },
 
         receiptImage: {
             type: String,
@@ -147,11 +171,15 @@ supplySchema.pre('save', function (next) {
     if (this.payments && this.payments.length > 0) {
         this.paidAmount = this.payments.reduce((sum, p) => sum + p.amount, 0);
     }
+    this.creditApplied = (this.payments || []).reduce((sum, p) => sum + (p.creditFrom ? p.amount : 0), 0);
+    this.creditUsed = (this.creditTransfers || []).reduce((sum, t) => sum + t.amount, 0);
 
     // Effective amount owed = totalAmount - totalReturned
     const effectiveAmount = this.totalAmount - this.totalReturned;
-    this.remainingAmount = effectiveAmount - this.paidAmount;
-    if (this.remainingAmount < 0) this.remainingAmount = 0;
+    // Signed: negative = vendor owes us (credit). Credit passed on to other
+    // supplies is no longer available here.
+    this.balance = Math.round((effectiveAmount - this.paidAmount + this.creditUsed) * 100) / 100;
+    this.remainingAmount = Math.max(0, this.balance);
 
     if (effectiveAmount <= 0 && this.totalReturned > 0) {
         // Fully returned — nothing owed because items were sent back
@@ -159,7 +187,7 @@ supplySchema.pre('save', function (next) {
         this.remainingAmount = 0;
     } else if (this.paidAmount <= 0) {
         this.paymentStatus = 'unpaid';
-    } else if (this.paidAmount >= effectiveAmount) {
+    } else if (this.balance <= 0.005) {
         this.paymentStatus = 'paid';
         this.remainingAmount = 0;
     } else {
@@ -170,6 +198,7 @@ supplySchema.pre('save', function (next) {
 
 supplySchema.index({ supplyNumber: 1, business: 1 }, { unique: true });
 supplySchema.index({ business: 1, vendor: 1 });
+supplySchema.index({ business: 1, vendor: 1, billDate: 1 });
 supplySchema.index({ business: 1, paymentStatus: 1 });
 supplySchema.index({ business: 1, billDate: -1 });
 supplySchema.index({ business: 1, createdAt: -1 });

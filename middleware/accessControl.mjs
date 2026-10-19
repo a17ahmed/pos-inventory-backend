@@ -167,7 +167,9 @@ const ROUTE_PERMISSIONS = {
             '/returns/receipt/*': { module: 'returns', action: 'view' },
             '/returns/product/*': { module: 'returns', action: 'create' },
             '/stats':    { module: 'dashboard', action: 'view' },
-            '/top-products': { module: 'reports', action: 'view' },
+            // POS Quick Add grid — anyone who can open the POS (profit is
+            // stripped in the controller unless pos.viewProfit)
+            '/top-products': { module: 'pos', action: 'view' },
             '/report/*': { module: 'reports', action: 'view' }
         },
         POST: {

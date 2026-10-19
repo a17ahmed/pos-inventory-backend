@@ -3,7 +3,22 @@ import Supply from '../models/supply.mjs';
 import Counter from '../models/counter.mjs';
 import mongoose from 'mongoose';
 import { recordCashEntry } from './cashbook.mjs';
+import CashBook from '../models/cashbook.mjs';
 import { startOfDay, endOfDay } from '../utils/dateHelpers.mjs';
+import { settleVendorCredit, VENDOR_TOTALS_GROUP, vendorTotals } from '../utils/vendorCredit.mjs';
+
+const creditActor = (req) => ({ name: req.user.adminId ? 'Admin' : req.user.name || 'Staff' });
+
+// Totals for one vendor (amount we owe, vendor credit, …) — see VENDOR_TOTALS_GROUP
+const getVendorTotals = async (vendorId, businessId, session = null) => {
+    const q = Supply.aggregate([
+        { $match: { vendor: new mongoose.Types.ObjectId(vendorId), business: new mongoose.Types.ObjectId(businessId) } },
+        { $group: { _id: null, ...VENDOR_TOTALS_GROUP } },
+    ]);
+    if (session) q.session(session);
+    const [row] = await q;
+    return vendorTotals(row);
+};
 
 // Create vendor
 const createVendor = async (req, res) => {
@@ -103,15 +118,7 @@ const getAllVendors = async (req, res) => {
                     vendor: { $in: vendorIds }
                 }
             },
-            {
-                $group: {
-                    _id: '$vendor',
-                    totalBusiness: { $sum: '$totalAmount' },
-                    totalPaid: { $sum: '$paidAmount' },
-                    totalRemaining: { $sum: '$remainingAmount' },
-                    supplyCount: { $sum: 1 }
-                }
-            }
+            { $group: { _id: '$vendor', ...VENDOR_TOTALS_GROUP } }
         ]);
 
         const statsMap = {};
@@ -121,10 +128,7 @@ const getAllVendors = async (req, res) => {
 
         const result = vendors.map(v => ({
             ...v,
-            totalBusiness: statsMap[v._id.toString()]?.totalBusiness || 0,
-            totalPaid: statsMap[v._id.toString()]?.totalPaid || 0,
-            totalRemaining: statsMap[v._id.toString()]?.totalRemaining || 0,
-            supplyCount: statsMap[v._id.toString()]?.supplyCount || 0
+            ...vendorTotals(statsMap[v._id.toString()])
         }));
 
         res.json(result);
@@ -151,32 +155,13 @@ const getVendor = async (req, res) => {
                 vendor: vendor._id,
                 business: req.user.businessId
             }).sort({ createdAt: -1 }),
-            Supply.aggregate([
-                {
-                    $match: {
-                        vendor: new mongoose.Types.ObjectId(vendor._id),
-                        business: new mongoose.Types.ObjectId(req.user.businessId)
-                    }
-                },
-                {
-                    $group: {
-                        _id: null,
-                        totalBusiness: { $sum: '$totalAmount' },
-                        totalPaid: { $sum: '$paidAmount' },
-                        totalRemaining: { $sum: '$remainingAmount' },
-                        supplyCount: { $sum: 1 }
-                    }
-                }
-            ]),
+            getVendorTotals(vendor._id, req.user.businessId),
         ]);
 
         res.json({
             ...vendor,
             supplies,
-            totalBusiness: totals[0]?.totalBusiness || 0,
-            totalPaid: totals[0]?.totalPaid || 0,
-            totalRemaining: totals[0]?.totalRemaining || 0,
-            supplyCount: totals[0]?.supplyCount || 0
+            ...totals
         });
     } catch (error) {
         res.status(500).json({ message: error.message });
@@ -229,26 +214,17 @@ const deleteVendor = async (req, res) => {
             return res.status(404).json({ message: 'Vendor not found' });
         }
 
-        // Check for outstanding balance
-        const outstanding = await Supply.aggregate([
-            {
-                $match: {
-                    vendor: new mongoose.Types.ObjectId(vendor._id),
-                    business: new mongoose.Types.ObjectId(req.user.businessId),
-                    paymentStatus: { $nin: ['paid', 'returned'] }
-                }
-            },
-            {
-                $group: {
-                    _id: null,
-                    totalRemaining: { $sum: '$remainingAmount' }
-                }
-            }
-        ]);
+        // Check for outstanding balance either way
+        const totals = await getVendorTotals(vendor._id, req.user.businessId);
 
-        if (outstanding[0]?.totalRemaining > 0) {
+        if (totals.totalRemaining > 0) {
             return res.status(400).json({
-                message: `Cannot delete vendor with outstanding balance of Rs ${outstanding[0].totalRemaining}`
+                message: `Cannot delete vendor with outstanding balance of Rs ${totals.totalRemaining}`
+            });
+        }
+        if (totals.totalCredit > 0) {
+            return res.status(400).json({
+                message: `Cannot delete vendor — they still owe you Rs ${totals.totalCredit} in credit from returns`
             });
         }
 
@@ -309,22 +285,47 @@ const getVendorLedger = async (req, res) => {
             });
 
             // Payment entries (credit - we paid the vendor)
+            // A payment with creditFrom is vendor credit moved in from another
+            // supply (no money paid) — paired with that supply's credit_transfer row.
             if (supply.payments && supply.payments.length > 0) {
                 for (const payment of supply.payments) {
+                    const fromCredit = !!payment.creditFrom;
                     ledger.push({
                         type: 'payment',
                         date: payment.paidAt,
-                        description: `Payment for Supply #${supply.supplyNumber}`,
+                        description: fromCredit
+                            ? `Paid from credit of Supply #${payment.creditFromSupplyNumber}`
+                            : `Payment for Supply #${supply.supplyNumber}`,
                         supplyId: supply._id,
                         supplyNumber: supply.supplyNumber,
                         debit: 0,
                         credit: payment.amount,
                         method: payment.method,
+                        fromCredit,
+                        ...(fromCredit && {
+                            creditFromSupplyId: payment.creditFrom,
+                            creditFromSupplyNumber: payment.creditFromSupplyNumber
+                        }),
                         paidBy: payment.paidBy,
                         reference: payment.reference,
                         notes: payment.note
                     });
                 }
+            }
+
+            // Credit this supply had (overpaid after a return) moved to another supply
+            for (const t of supply.creditTransfers || []) {
+                ledger.push({
+                    type: 'credit_transfer',
+                    date: t.at,
+                    description: `Credit from Supply #${supply.supplyNumber} used on Supply #${t.toSupplyNumber}`,
+                    supplyId: supply._id,
+                    supplyNumber: supply.supplyNumber,
+                    toSupplyId: t.toSupply,
+                    toSupplyNumber: t.toSupplyNumber,
+                    debit: t.amount,
+                    credit: 0
+                });
             }
 
             // Return entries (credit - vendor owes us back / reduces what we owe)
@@ -348,25 +349,28 @@ const getVendorLedger = async (req, res) => {
 
         // Sort by date, with type priority for same-timestamp entries
         // (debit/supply before credit/payment so running balance makes sense)
-        const typePriority = { opening_balance: 0, supply: 1, return: 2, payment: 3 };
+        const typePriority = { opening_balance: 0, supply: 1, return: 2, credit_transfer: 3, payment: 4 };
         ledger.sort((a, b) => {
             const dateDiff = new Date(a.date) - new Date(b.date);
             if (dateDiff !== 0) return dateDiff;
             return (typePriority[a.type] || 0) - (typePriority[b.type] || 0);
         });
 
-        // Calculate running balance
+        // Calculate running balance (credit_transfer + its fromCredit payment net to 0)
         let runningBalance = 0;
         for (const entry of ledger) {
-            runningBalance += entry.debit - entry.credit;
+            runningBalance = Math.round((runningBalance + entry.debit - entry.credit) * 100) / 100;
             entry.balance = runningBalance;
         }
 
-        // Summary
-        const totalDebit = ledger.reduce((sum, e) => sum + e.debit, 0);
-        const totalPaid = ledger.filter(e => e.type === 'payment').reduce((sum, e) => sum + e.credit, 0);
-        const totalReturns = ledger.filter(e => e.type === 'return').reduce((sum, e) => sum + e.credit, 0);
+        // Summary — credit moved between supplies is neither a supply nor a payment
+        const round2 = (x) => Math.round(x * 100) / 100;
+        const totalDebit = round2(ledger.filter(e => e.type === 'supply' || e.type === 'opening_balance').reduce((sum, e) => sum + e.debit, 0));
+        const totalPaid = round2(ledger.filter(e => e.type === 'payment' && !e.fromCredit).reduce((sum, e) => sum + e.credit, 0));
+        const totalReturns = round2(ledger.filter(e => e.type === 'return').reduce((sum, e) => sum + e.credit, 0));
         const totalCredit = totalPaid + totalReturns;
+        // Whole-vendor position (not limited by the date filter)
+        const totals = await getVendorTotals(vendor._id, req.user.businessId);
 
         res.json({
             vendor: {
@@ -380,9 +384,13 @@ const getVendorLedger = async (req, res) => {
                 totalSupplies: totalDebit,
                 totalPaid,
                 totalReturns,
-                currentBalance: totalDebit - totalCredit,
+                currentBalance: round2(totalDebit - totalCredit),
                 totalEntries: ledger.length,
-                supplyCount: supplies.length
+                supplyCount: supplies.length,
+                // all-time, ignores startDate/endDate:
+                amountDue: totals.totalRemaining,   // we owe the vendor
+                vendorCredit: totals.totalCredit,   // vendor owes us (returns on paid supplies)
+                netBalance: totals.netBalance       // amountDue − vendorCredit
             }
         });
     } catch (error) {
@@ -410,56 +418,71 @@ const payVendor = async (req, res) => {
             return res.status(404).json({ message: 'Vendor not found' });
         }
 
-        // Fetch pending supplies — oldest first (FIFO)
-        const pendingSupplies = await Supply.find({
-            vendor: vendor._id,
-            business: req.user.businessId,
-            paymentStatus: { $in: ['unpaid', 'partial'] }
-        }).sort({ billDate: 1, createdAt: 1 });
-
-        if (pendingSupplies.length === 0) {
-            return res.status(400).json({ message: 'No pending supplies for this vendor' });
-        }
-
-        const totalOutstanding = pendingSupplies.reduce((sum, s) => sum + s.remainingAmount, 0);
-
-        if (payAmount > totalOutstanding) {
-            return res.status(400).json({
-                message: `Payment amount (Rs ${payAmount}) exceeds total outstanding (Rs ${totalOutstanding})`
-            });
-        }
-
         const paidBy = req.user.adminId ? 'Admin' : req.user.name || '';
         const paymentMethod = method || 'cash';
         const paymentNote = note ? `FIFO vendor payment - ${note}` : 'FIFO vendor payment';
 
-        // Cash balance check — ensure enough cash in hand for cash payments
-        if (paymentMethod === 'cash') {
-            const CashBook = (await import('../models/cashbook.mjs')).default;
-            const latest = await CashBook.findOne({ business: req.user.businessId })
-                .sort({ createdAt: -1, entryNumber: -1 })
-                .select('runningBalance')
-                .lean();
-            const cashBalance = latest?.runningBalance ?? 0;
-            if (payAmount > cashBalance) {
-                return res.status(400).json({
-                    message: `Insufficient cash in hand. Available: Rs ${cashBalance.toLocaleString()}, Required: Rs ${payAmount.toLocaleString()}`,
-                });
-            }
-        }
-
         // Distribute payment across supplies in a transaction
         const session = await mongoose.startSession();
         const allocations = [];
+        let creditApplied = [];
+        let totalOutstanding = 0;
         let remainingToAllocate = payAmount;
 
         try {
             session.startTransaction();
 
-            for (const supply of pendingSupplies) {
-                if (remainingToAllocate <= 0) break;
+            const reject = async (status, message) => {
+                await session.abortTransaction();
+                // finally block handles session.endSession()
+                return res.status(status).json({ message });
+            };
 
-                const allocate = Math.min(supply.remainingAmount, remainingToAllocate);
+            // Credit the vendor owes us (returns on paid supplies) is used first
+            creditApplied = await settleVendorCredit({
+                vendorId: vendor._id,
+                businessId: req.user.businessId,
+                session,
+                actor: creditActor(req),
+            });
+            const creditNote = creditApplied.length > 0
+                ? ` (Rs ${Math.round(creditApplied.reduce((sum, m) => sum + m.amount, 0) * 100) / 100} vendor credit was applied first)`
+                : '';
+
+            // Fetch pending supplies — oldest first (FIFO)
+            const pendingSupplies = await Supply.find({
+                vendor: vendor._id,
+                business: req.user.businessId,
+                paymentStatus: { $in: ['unpaid', 'partial'] }
+            }).sort({ billDate: 1, createdAt: 1 }).session(session);
+
+            if (pendingSupplies.length === 0) {
+                return await reject(400, `No pending supplies for this vendor${creditNote}`);
+            }
+
+            totalOutstanding = Math.round(pendingSupplies.reduce((sum, s) => sum + s.remainingAmount, 0) * 100) / 100;
+
+            if (payAmount > totalOutstanding + 0.005) {
+                return await reject(400, `Payment amount (Rs ${payAmount}) exceeds total outstanding (Rs ${totalOutstanding})${creditNote}`);
+            }
+
+            // Cash balance check — ensure enough cash in hand for cash payments
+            if (paymentMethod === 'cash') {
+                const latest = await CashBook.findOne({ business: req.user.businessId })
+                    .sort({ createdAt: -1, entryNumber: -1 })
+                    .select('runningBalance')
+                    .session(session)
+                    .lean();
+                const cashBalance = latest?.runningBalance ?? 0;
+                if (payAmount > cashBalance) {
+                    return await reject(400, `Insufficient cash in hand. Available: Rs ${cashBalance.toLocaleString()}, Required: Rs ${payAmount.toLocaleString()}`);
+                }
+            }
+
+            for (const supply of pendingSupplies) {
+                if (remainingToAllocate <= 0.005) break;
+
+                const allocate = Math.round(Math.min(supply.remainingAmount, remainingToAllocate) * 100) / 100;
                 const previouslyPaid = supply.paidAmount;
 
                 supply.payments.push({
@@ -486,7 +509,7 @@ const payVendor = async (req, res) => {
                     newStatus: supply.paymentStatus
                 });
 
-                remainingToAllocate -= allocate;
+                remainingToAllocate = Math.round((remainingToAllocate - allocate) * 100) / 100;
             }
 
             // Record in cashbook (only for cash payments)
@@ -529,12 +552,13 @@ const payVendor = async (req, res) => {
                 paidBy
             },
             allocations,
+            creditApplied,   // [{ fromNumber, toNumber, amount }] vendor credit used before this payment
             summary: {
                 suppliesAffected: allocations.length,
                 suppliesFullyPaid: fullyPaid,
                 suppliesPartiallyPaid: partiallyPaid,
                 outstandingBefore: totalOutstanding,
-                outstandingAfter: totalOutstanding - payAmount
+                outstandingAfter: Math.round((totalOutstanding - payAmount) * 100) / 100
             }
         });
     } catch (error) {
