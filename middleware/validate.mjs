@@ -1,8 +1,10 @@
 /**
  * Joi validation middleware factory.
  * Usage: validate(schema) as Express middleware
+ * Options: { readableMessage: true } → `message` carries the actual errors
+ * (e.g. "Reason is required") instead of "Validation failed".
  */
-const validate = (schema) => (req, res, next) => {
+const validate = (schema, { readableMessage = false } = {}) => (req, res, next) => {
     const { error } = schema.validate(req.body, {
         abortEarly: false,
         stripUnknown: false,
@@ -16,7 +18,7 @@ const validate = (schema) => (req, res, next) => {
         }));
 
         return res.status(400).json({
-            message: "Validation failed",
+            message: readableMessage ? errors.map((e) => e.message).join(". ") : "Validation failed",
             errors,
         });
     }

@@ -4,6 +4,7 @@ import Customer from '../models/customer.mjs';
 import StockMovement from '../models/stockMovement.mjs';
 import Counter from '../models/counter.mjs';
 import { startOfDay, endOfDay } from '../utils/dateHelpers.mjs';
+import { ADJUSTMENT_REASONS, ADJUSTMENT_REASON_CODES, adjustmentReasonText } from '../utils/stockAdjustment.mjs';
 
 // ─────────────────────────────────────────────────────────────
 // Helpers: auto-generate SKU and barcode per business
@@ -285,53 +286,87 @@ const deleteProduct = async (req, res) => {
     }
 };
 
-// Update stock quantity (atomic)
+// Manual stock adjustment: changes stock and records why (a StockMovement),
+// in one transaction. No money moves (no cash book / expense / profit).
 const updateStock = async (req, res) => {
     try {
-        const { quantity, operation } = req.body; // operation: 'add', 'subtract', 'set'
+        const { quantity, operation, reason } = req.body; // operation: 'add', 'subtract', 'set'
+        const note = String(req.body.note || '').trim();
+
+        if (reason === 'other' && !note) {
+            return res.status(400).json({ message: 'A note is required when the reason is Other' });
+        }
+
+        const allowedOp = ADJUSTMENT_REASONS[reason]?.operation;
+        if (allowedOp && allowedOp !== operation) {
+            return res.status(400).json({
+                message: `${ADJUSTMENT_REASONS[reason].label} can only ${allowedOp === 'add' ? 'add' : 'remove'} stock`
+            });
+        }
 
         const filter = { _id: req.params.id, business: req.user.businessId };
+        const performedBy = req.user.adminId ? 'Admin' : req.user.name || '';
+        const performedById = req.user.adminId || req.user.id || null;
 
-        if (operation === 'set') {
-            if (quantity < 0) {
-                return res.status(400).json({ message: 'Stock quantity cannot be negative' });
-            }
-            const product = await Product.findOneAndUpdate(filter, { $set: { stockQuantity: quantity } }, { new: true });
-            if (!product) {
-                return res.status(404).json({ message: 'Product not found' });
-            }
-            return res.json(product);
-        }
+        const session = await mongoose.startSession();
+        try {
+            session.startTransaction();
 
-        let delta;
-        if (operation === 'add') delta = quantity;
-        else if (operation === 'subtract') delta = -quantity;
-        else return res.status(400).json({ message: 'Invalid operation' });
+            const reject = async (status, body) => {
+                await session.abortTransaction();
+                // finally block handles session.endSession()
+                return res.status(status).json(body);
+            };
 
-        if (delta < 0) {
-            // Only apply the decrement if enough stock is available, atomically —
-            // a plain $inc here (with the negative-check done after the write)
-            // would let concurrent requests race stock below zero.
+            const current = await Product.findOne(filter).session(session);
+            if (!current) return await reject(404, { message: 'Product not found' });
+            if (current.trackStock === false) return await reject(400, { message: "This product doesn't track stock" });
+
+            const before = current.stockQuantity || 0;
+            const delta = operation === 'set' ? quantity - before
+                : operation === 'add' ? quantity
+                : -quantity;
+            if (delta === 0) return await reject(400, { message: `No change: stock is already ${before}` });
+
+            // Subtract: only if enough stock, atomically (also guards "set" lower).
+            // Same snapshot as the read above, so a concurrent change is a write conflict.
             const product = await Product.findOneAndUpdate(
-                { ...filter, stockQuantity: { $gte: -delta } },
+                delta < 0 ? { ...filter, stockQuantity: { $gte: -delta } } : filter,
                 { $inc: { stockQuantity: delta } },
-                { new: true }
+                { new: true, session }
             );
-
             if (!product) {
-                const exists = await Product.exists(filter);
-                if (!exists) return res.status(404).json({ message: 'Product not found' });
-                return res.status(400).json({ message: 'Insufficient stock for this operation' });
+                return await reject(400, { message: 'Insufficient stock for this operation', available: before });
             }
 
-            return res.json(product);
-        }
+            const [movement] = await StockMovement.create([{
+                product: product._id,
+                productName: product.name,
+                type: 'manual_adjustment',
+                quantity: delta,
+                previousStock: product.stockQuantity - delta,
+                newStock: product.stockQuantity,
+                referenceType: 'manual',
+                unitPrice: product.costPrice || 0,
+                adjustmentReason: reason,
+                note,
+                reason: adjustmentReasonText(reason, note),
+                performedBy,
+                performedById,
+                business: req.user.businessId,
+            }], { session });
 
-        const product = await Product.findOneAndUpdate(filter, { $inc: { stockQuantity: delta } }, { new: true });
-        if (!product) {
-            return res.status(404).json({ message: 'Product not found' });
+            await session.commitTransaction();
+            res.json({ product, movement });
+        } catch (txError) {
+            if (session.inTransaction()) await session.abortTransaction();
+            if (txError.errorLabels?.includes?.('TransientTransactionError') || txError.code === 112) {
+                return res.status(409).json({ message: 'Stock was changed at the same time. Please try again.' });
+            }
+            throw txError;
+        } finally {
+            session.endSession();
         }
-        res.json(product);
     } catch (error) {
         console.error('[Product]', error.message);
         res.status(500).json({ message: 'Something went wrong' });
@@ -494,13 +529,20 @@ const getProductBySku = async (req, res) => {
 // Get stock movement history for a product (or all products)
 const getStockMovements = async (req, res) => {
     try {
-        const { productId, type, startDate, endDate, page = 1 } = req.query;
+        const { productId, type, reason, startDate, endDate, page = 1 } = req.query;
         // Cap limit to [1,100] so a caller can't request the whole table (?limit=100000).
         const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 100);
         const filter = { business: req.user.businessId };
 
         if (productId) filter.product = productId;
         if (type) filter.type = type;
+        // Manual adjustments by reason code (e.g. ?reason=transfer_out)
+        if (reason) {
+            if (!ADJUSTMENT_REASON_CODES.includes(reason)) {
+                return res.status(400).json({ message: `reason must be one of: ${ADJUSTMENT_REASON_CODES.join(', ')}` });
+            }
+            filter.adjustmentReason = reason;
+        }
         if (startDate || endDate) {
             filter.createdAt = {};
             if (startDate) filter.createdAt.$gte = startOfDay(startDate);
@@ -520,7 +562,13 @@ const getStockMovements = async (req, res) => {
         ]);
 
         res.json({
-            movements,
+            // Same fields on every row (older movements / other types: empty)
+            movements: movements.map((m) => ({
+                ...m,
+                note: m.note || '',
+                adjustmentReason: m.adjustmentReason || null,
+                performedBy: m.performedBy || '',
+            })),
             total,
             page: Number(page),
             totalPages: Math.ceil(total / Number(limit))

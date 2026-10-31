@@ -1,4 +1,5 @@
 import Joi from "joi";
+import { ADJUSTMENT_REASON_CODES, NOTE_MAX_LENGTH } from "../utils/stockAdjustment.mjs";
 
 const objectId = Joi.string().regex(/^[0-9a-fA-F]{24}$/, "valid ObjectId");
 
@@ -256,8 +257,34 @@ export const updateProductSchema = Joi.object({
 });
 
 export const updateStockSchema = Joi.object({
-    quantity: Joi.number().required(),
-    operation: Joi.string().valid("add", "subtract", "set").required(),
+    operation: Joi.string().valid("add", "subtract", "set").required()
+        .messages({ "any.required": "Operation is required", "any.only": "Operation must be add, subtract or set" }),
+    quantity: Joi.number().integer().required()
+        .when("operation", {
+            is: "set",
+            then: Joi.number().min(0).messages({ "number.min": "Quantity can't be negative" }),
+            otherwise: Joi.number().greater(0).messages({ "number.greater": "Quantity must be more than 0" }),
+        })
+        .messages({
+            "any.required": "Quantity is required",
+            "number.base": "Quantity must be a number",
+            "number.integer": "Quantity must be a whole number",
+        }),
+    reason: Joi.string().valid(...ADJUSTMENT_REASON_CODES).required()
+        .messages({
+            "any.required": "Reason is required",
+            "string.empty": "Reason is required",
+            "any.only": `Reason must be one of: ${ADJUSTMENT_REASON_CODES.join(", ")}`,
+        }),
+    note: Joi.string().trim().max(NOTE_MAX_LENGTH).allow("")
+        .when("reason", { is: "other", then: Joi.string().trim().min(1).required() })
+        .messages({
+            "any.required": 'A note is required when the reason is Other',
+            "string.empty": 'A note is required when the reason is Other',
+            "string.min": 'A note is required when the reason is Other',
+            "string.max": `Note can be at most ${NOTE_MAX_LENGTH} characters`,
+            "string.base": "Note must be text",
+        }),
 });
 
 export const bulkUpdateStockSchema = Joi.object({

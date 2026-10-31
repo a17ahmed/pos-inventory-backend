@@ -234,6 +234,8 @@ billSchema.index({ business: 1, type: 1, status: 1, createdAt: -1 });
 billSchema.index({ business: 1, createdAt: -1 });
 billSchema.index({ cashier: 1, business: 1 });
 billSchema.index({ customer: 1, business: 1 });
+// Customer statement: a customer's bills in date order
+billSchema.index({ customer: 1, business: 1, createdAt: 1 });
 billSchema.index(
     { idempotencyKey: 1 },
     { unique: true, partialFilterExpression: { idempotencyKey: { $type: "string" } } }

@@ -1,4 +1,5 @@
 import mongoose, { Schema } from 'mongoose';
+import { ADJUSTMENT_REASON_CODES } from '../utils/stockAdjustment.mjs';
 
 const stockMovementSchema = new Schema(
     {
@@ -49,6 +50,21 @@ const stockMovementSchema = new Schema(
             default: ''
         },
         performedBy: {
+            type: String,
+            default: ''
+        },
+        // Admin / employee id behind the movement (manual adjustments)
+        performedById: {
+            type: Schema.Types.ObjectId,
+            default: null
+        },
+        // Manual adjustment only: why, and the user's note (e.g. "Branch 2")
+        adjustmentReason: {
+            type: String,
+            enum: [...ADJUSTMENT_REASON_CODES, null],
+            default: null
+        },
+        note: {
             type: String,
             default: ''
         },

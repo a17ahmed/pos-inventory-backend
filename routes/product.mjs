@@ -45,7 +45,7 @@ productRouter
     .post('/bulk-stock', validate(bulkUpdateStockSchema), bulkUpdateStock)
     .get('/:id', getProduct)
     .patch('/:id', validate(updateProductSchema), updateProduct)
-    .patch('/:id/stock', validate(updateStockSchema), updateStock)
+    .patch('/:id/stock', validate(updateStockSchema, { readableMessage: true }), updateStock)
     .delete('/:id', deleteProduct);
 
 export default productRouter;
