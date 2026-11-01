@@ -97,7 +97,10 @@ const businessSchema = new Schema(
             autoSendToKitchen: { type: Boolean, default: true },
             // Allow a limit-override bill line to go below cost price
             // (POS warns first). Off = the cost-price floor is always enforced.
-            allowSellBelowCost: { type: Boolean, default: false }
+            allowSellBelowCost: { type: Boolean, default: false },
+            // Let the POS add items to a registered customer's credit bill from
+            // today instead of making a new bill (POST /bill/:id/add-items)
+            allowBillAmend: { type: Boolean, default: false }
         },
         isActive: {
             type: Boolean,

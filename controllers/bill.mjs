@@ -9,7 +9,7 @@ import StockMovement from "../models/stockMovement.mjs";
 import CashBook from "../models/cashbook.mjs";
 import { recordCashEntry } from "./cashbook.mjs";
 import { startOfToday, startOfMonth, startOfWeek, endOfDay as endOfDayHelper, startOfDay, toLocalDateString, toLocalTimeString, getTimezone } from "../utils/dateHelpers.mjs";
-import { canViewProfit, hasPosPermission } from "../middleware/accessControl.mjs";
+import { canViewProfit, hasPosPermission, getAccessForEmployee } from "../middleware/accessControl.mjs";
 import { settleCustomerCredit, unwindCreditFrom, releaseCreditOn } from "../utils/storeCredit.mjs";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -206,7 +206,7 @@ const deductStock = async (items, businessId, billRef = {}, session = null) => {
                 referenceId: billRef.id || null,
                 referenceNumber: billRef.number ? `BILL-${billRef.number}` : '',
                 unitPrice: i.price || i.sellingPrice || 0,
-                reason: 'Item sold',
+                reason: billRef.reason || 'Item sold',
                 performedBy: billRef.performedBy || '',
                 business: businessId
             };
@@ -2516,6 +2516,349 @@ export const getTopProducts = async (req, res) => {
     } catch (error) {
         console.error("Error fetching top products:", error);
         res.status(500).json({ message: "Failed to fetch top products" });
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ADD ITEMS TO TODAY'S CREDIT BILL
+// ═══════════════════════════════════════════════════════════════════════════
+// A registered customer comes back the same day: the POS can add the new items
+// to their open credit bill instead of making a new one. Add only — earlier
+// lines are never changed; to take an item back, use Return on the bill.
+// Off unless the shop turns on settings.allowBillAmend.
+
+const OPEN_DUE = 0.005;
+
+/** Why this bill can't take more items (null = it can). */
+const amendBlockReason = (bill, { todayStart, lastClosingAt }) => {
+    if (bill.type !== "sale") return "Only sale bills can take more items";
+    if (bill.status !== "completed") return "Only completed bills can take more items";
+    if (!bill.customer) return "Only a registered customer's bill can take more items";
+    if (new Date(bill.createdAt) < todayStart) return "This bill isn't from today. Make a new bill.";
+    if (lastClosingAt && new Date(bill.createdAt) <= new Date(lastClosingAt)) {
+        return "Store closing was done after this bill. Make a new bill.";
+    }
+    if (bill.returnStatus === "full") return "This bill was fully returned. Make a new bill.";
+    if (Math.abs(bill.amountDue || 0) <= OPEN_DUE) return "This bill is fully paid. Make a new bill.";
+    return null;
+};
+
+/** Admin, or an employee who can make sales and hasn't had pos.amendBill turned off. */
+const canAmendBills = async (req) => {
+    if (req.user?.adminId) return true;
+    const employeeId = req.user?.id || req.user?.employeeId;
+    if (!employeeId) return false;
+    const permissions = await getAccessForEmployee(employeeId, req.user.businessId);
+    return permissions?.pos?.create === true && permissions?.pos?.amendBill !== false;
+};
+
+const round2 = (x) => Math.round((x || 0) * 100) / 100;
+
+/**
+ * GET /bill/open-for-customer/:customerId
+ * The customer's sale bills from today, each with canAmend + blockedReason,
+ * for the POS "Add to this bill / New bill" choice.
+ */
+export const getOpenBillsForCustomer = async (req, res) => {
+    try {
+        const { customerId } = req.params;
+        if (!mongoose.Types.ObjectId.isValid(customerId)) {
+            return res.status(404).json({ message: "Customer not found" });
+        }
+        const [customer, business, userCanAmend] = await Promise.all([
+            Customer.findOne({ _id: customerId, business: req.user.businessId }, { name: 1, phone: 1, balance: 1 }).lean(),
+            Business.findById(req.user.businessId).select("settings.allowBillAmend lastClosingAt").lean(),
+            canAmendBills(req),
+        ]);
+        if (!customer) return res.status(404).json({ message: "Customer not found" });
+
+        const enabled = business?.settings?.allowBillAmend === true;
+        const todayStart = startOfToday();
+        const bills = await Bill.find({
+            business: req.user.businessId,
+            customer: customer._id,
+            type: "sale",
+            status: "completed",
+            createdAt: { $gte: todayStart },
+        }).sort({ createdAt: -1 }).lean();
+
+        res.json({
+            enabled,
+            canAmend: enabled && userCanAmend,
+            customer: { _id: customer._id, name: customer.name, phone: customer.phone, balance: round2(customer.balance) },
+            bills: bills.map((b) => {
+                const blockedReason = amendBlockReason(b, { todayStart, lastClosingAt: business?.lastClosingAt });
+                return {
+                    billId: b._id,
+                    billNumber: b.billNumber,
+                    createdAt: b.createdAt,
+                    total: round2(b.total),
+                    paid: round2(b.amountPaid),
+                    returned: round2(b.totalRefunded),
+                    due: round2(b.amountDue),
+                    paymentStatus: b.paymentStatus,
+                    returnStatus: b.returnStatus,
+                    discountMode: b.discountMode,
+                    revision: b.revisionCount || 0,
+                    items: b.items.map((i) => ({
+                        itemId: i._id,
+                        product: i.product,
+                        name: i.name,
+                        qty: i.qty,
+                        price: i.price,
+                        discountAmount: i.discountAmount || 0,
+                        itemTotal: round2(i.itemTotal),
+                        returnedQty: i.returnedQty || 0,
+                        revision: i.revision || 0,
+                        addedAt: i.addedAt || null,
+                        addedBy: i.addedBy || "",
+                    })),
+                    canAmend: enabled && userCanAmend && !blockedReason,
+                    blockedReason: !enabled
+                        ? "Adding to an earlier bill is turned off for this shop"
+                        : !userCanAmend
+                            ? "You don't have permission to add items to a bill"
+                            : blockedReason,
+                };
+            }),
+        });
+    } catch (error) {
+        console.error("Error fetching open bills:", error);
+        res.status(500).json({ message: "Failed to fetch open bills" });
+    }
+};
+
+/**
+ * POST /bill/:id/add-items
+ * Body: { customer, revision, idempotencyKey, items[], payment?, note? }
+ * New lines go through the same pricing / discount / stock rules as a sale.
+ * One transaction: lines + stock + credit settlement + payment + cash book.
+ */
+export const addItemsToBill = async (req, res) => {
+    try {
+        const { customer: customerId, revision, idempotencyKey, payment } = req.body;
+        const note = String(req.body.note || "").trim();
+        const byName = req.user.adminId ? "Admin" : (req.user.name || "Staff");
+
+        const business = await Business.findById(req.user.businessId)
+            .select("settings.allowBillAmend settings.allowSellBelowCost lastClosingAt")
+            .lean();
+        if (business?.settings?.allowBillAmend !== true) {
+            return res.status(403).json({ message: "Adding to an earlier bill is turned off for this shop" });
+        }
+        if (!(await canAmendBills(req))) {
+            return res.status(403).json({ message: "You don't have permission to add items to a bill" });
+        }
+
+        // Same pricing rules as a sale. Cost always comes from the product.
+        const enrichedItems = normalizeDiscountFields(
+            await enrichItemsWithCost(req.body.items.map(({ costPrice, ...rest }) => rest), req.user.businessId),
+            true
+        );
+        if (enrichedItems.some((i) => i.limitOverride) && !(await hasPosPermission(req, "sellBeyondLimit"))) {
+            return res.status(403).json({ message: "You are not allowed to sell beyond the discount limit" });
+        }
+        const { error: discountCapError } = validateDiscountLimits(enrichedItems, {
+            allowSellBelowCost: business?.settings?.allowSellBelowCost === true,
+        });
+        if (discountCapError) return res.status(400).json({ message: discountCapError });
+
+        const addedTotal = round2(enrichedItems.reduce((sum, i) => sum + (i.price || 0) * (i.qty || 1) - (i.discountAmount || 0), 0));
+        const hasItemDiscounts = enrichedItems.some((i) => (i.discountAmount || 0) > 0);
+
+        const session = await mongoose.startSession();
+        try {
+            session.startTransaction();
+
+            const reject = async (status, body) => {
+                await session.abortTransaction();
+                // finally block handles session.endSession()
+                return res.status(status).json(body);
+            };
+
+            let bill = await Bill.findOne({ _id: req.params.id, business: req.user.businessId }).session(session);
+            if (!bill) return await reject(404, { message: "Bill not found" });
+
+            // Same save sent twice (double click / offline retry) → already done
+            if ((bill.revisions || []).some((r) => r.idempotencyKey === idempotencyKey)) {
+                return await reject(409, {
+                    alreadyApplied: true,
+                    message: `These items were already added to Bill #${bill.billNumber}`,
+                    bill: redactProfitFields(bill, await canViewProfit(req)),
+                });
+            }
+            const blocked = amendBlockReason(bill, { todayStart: startOfToday(), lastClosingAt: business.lastClosingAt });
+            if (blocked) return await reject(400, { message: blocked });
+            if (String(bill.customer) !== String(customerId)) {
+                return await reject(400, { message: "This bill belongs to another customer" });
+            }
+            if ((bill.revisionCount || 0) !== revision) {
+                return await reject(409, {
+                    message: "This bill was just changed. Reload it and try again.",
+                    revision: bill.revisionCount || 0,
+                });
+            }
+            if (bill.discountMode === "bill" && hasItemDiscounts) {
+                return await reject(400, {
+                    message: "This bill has a bill discount, so new items can't have their own discount",
+                });
+            }
+
+            const customerDoc = await Customer.findOne({ _id: bill.customer, business: req.user.businessId }).session(session);
+            if (!customerDoc) return await reject(404, { message: "Customer not found" });
+            if (!customerDoc.isActive) return await reject(400, { message: "This customer has been deactivated" });
+            if (customerDoc.creditLimit > 0) {
+                const newCredit = addedTotal - (payment?.amount || 0);
+                if (newCredit > 0 && customerDoc.balance + newCredit > customerDoc.creditLimit) {
+                    return await reject(400, {
+                        message: `Credit limit exceeded. Limit: Rs ${customerDoc.creditLimit}, Outstanding: Rs ${customerDoc.balance}, New credit: Rs ${newCredit}`,
+                    });
+                }
+            }
+
+            // Stock check inside the transaction (combined qty per product)
+            const wanted = new Map();
+            for (const i of enrichedItems) {
+                if (!i.product || !mongoose.Types.ObjectId.isValid(i.product)) continue;
+                wanted.set(String(i.product), (wanted.get(String(i.product)) || 0) + (i.qty || 1));
+            }
+            if (wanted.size > 0) {
+                const products = await Product.find(
+                    { _id: { $in: [...wanted.keys()] }, business: req.user.businessId, trackStock: true },
+                    { name: 1, stockQuantity: 1 }
+                ).session(session).lean();
+                const outOfStock = products
+                    .filter((p) => p.stockQuantity < wanted.get(String(p._id)))
+                    .map((p) => ({ name: p.name, requested: wanted.get(String(p._id)), available: p.stockQuantity }));
+                if (outOfStock.length > 0) {
+                    return await reject(400, { message: "Insufficient stock for some items", outOfStock });
+                }
+            }
+
+            const now = new Date();
+            const number = (bill.revisionCount || 0) + 1;
+            const totalBefore = round2(bill.total);
+            const dueBefore = round2(bill.amountDue);
+
+            for (const i of enrichedItems) {
+                bill.items.push({ ...i, revision: number, addedAt: now, addedBy: byName });
+            }
+            if (hasItemDiscounts) {
+                bill.discountHistory.push({
+                    appliedBy: req.user.id,
+                    appliedByName: byName,
+                    appliedAt: now,
+                    mode: "item",
+                    itemDiscounts: enrichedItems
+                        .filter((i) => (i.discountAmount || 0) > 0)
+                        .map((i) => ({ name: i.name, product: i.product || null, qty: i.qty, discountAmount: i.discountAmount })),
+                    totalDiscountAmount: enrichedItems.reduce((sum, i) => sum + (i.discountAmount || 0), 0),
+                });
+            }
+            bill.revisionCount = number;
+            await bill.save({ session });
+            const newLines = bill.items.filter((i) => i.revision === number);
+
+            await deductStock(enrichedItems, req.user.businessId, {
+                id: bill._id,
+                number: bill.billNumber,
+                performedBy: byName,
+                reason: `Added to Bill #${bill.billNumber} (update ${number})`,
+            }, session);
+
+            // Spare customer credit pays unpaid bills (this one included)
+            const creditSettlement = await settleCustomerCredit({
+                customerId: bill.customer,
+                businessId: req.user.businessId,
+                session,
+                actor: settlementActor(req),
+            });
+            if (creditSettlement.length > 0) bill = await Bill.findById(bill._id).session(session);
+
+            // Optional payment taken with the new items
+            if (payment) {
+                const due = Math.max(0, bill.amountDue);
+                if (payment.amount > due + 0.01) {
+                    return await reject(400, {
+                        message: due > OPEN_DUE
+                            ? `Payment exceeds the amount due on this bill (Rs ${round2(due)})`
+                            : "This bill has nothing left to pay",
+                    });
+                }
+                bill.payments.push({
+                    amount: payment.amount,
+                    method: payment.method,
+                    paidAt: now,
+                    receivedBy: req.user.id,
+                    receivedByName: byName,
+                    note: note || `With items added (update ${number})`,
+                    reference: payment.reference || "",
+                });
+                if (payment.method === "cash") {
+                    await recordCashEntry({
+                        type: "sale_collection",
+                        amount: payment.amount,
+                        direction: "in",
+                        referenceType: "bill",
+                        referenceId: bill._id,
+                        referenceNumber: `Bill #${bill.billNumber}`,
+                        description: `Sale collection - Bill #${bill.billNumber} (items added)`,
+                        performedBy: byName,
+                        performedById: req.user.id,
+                        businessId: req.user.businessId,
+                        session,
+                    });
+                }
+            }
+
+            // History entry (totals after everything above)
+            await bill.save({ session }); // recalculates with the payment
+            const change = {
+                number,
+                at: now,
+                by: req.user.id,
+                byName,
+                items: newLines.map((i) => ({
+                    itemId: i._id, product: i.product, name: i.name, qty: i.qty, price: i.price,
+                    discountAmount: i.discountAmount || 0, lineTotal: round2(i.itemTotal),
+                })),
+                addedTotal,
+                totalBefore,
+                totalAfter: round2(bill.total),
+                dueBefore,
+                dueAfter: round2(bill.amountDue),
+                paymentAmount: payment?.amount || 0,
+                paymentMethod: payment?.method || "",
+                note,
+                idempotencyKey,
+            };
+            bill.revisions.push(change);
+            await bill.save({ session });
+
+            const customerBalance = round2((await Customer.findById(bill.customer).session(session).select("balance").lean())?.balance);
+
+            await session.commitTransaction();
+            res.json({
+                bill: redactProfitFields(bill, await canViewProfit(req)),
+                change: { ...change, idempotencyKey: undefined },
+                creditSettlement,
+                customerBalance,
+            });
+        } catch (txError) {
+            if (session.inTransaction()) await session.abortTransaction();
+            if (txError.errorLabels?.includes?.("TransientTransactionError") || txError.code === 112) {
+                return res.status(409).json({ message: "This bill was just changed. Reload it and try again." });
+            }
+            throw txError;
+        } finally {
+            session.endSession();
+        }
+    } catch (error) {
+        console.error("Error adding items to bill:", error);
+        if (error.name === "ValidationError") {
+            return res.status(400).json({ message: `Validation failed: ${Object.keys(error.errors).join(", ")}` });
+        }
+        res.status(500).json({ message: "Failed to add items to the bill" });
     }
 };
 

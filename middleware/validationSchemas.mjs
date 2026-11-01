@@ -129,6 +129,7 @@ export const updateBusinessSettingsSchema = Joi.object({
         requireTableForDineIn: Joi.boolean(),
         autoSendToKitchen: Joi.boolean(),
         allowSellBelowCost: Joi.boolean(),
+        allowBillAmend: Joi.boolean(),
     }),
     cashTaxRate: Joi.number().min(0).max(100),
     cardTaxRate: Joi.number().min(0).max(100),
@@ -497,6 +498,21 @@ export const createBillSchema = Joi.object({
     notes: Joi.string().allow(""),
     holdNote: Joi.string().allow(""),
     idempotencyKey: Joi.string().allow(""),
+});
+
+// Add items to a customer's credit bill from today. `revision` = the bill's
+// revisionCount the POS loaded (stale screen → 409).
+export const addBillItemsSchema = Joi.object({
+    customer: objectId.required(),
+    revision: Joi.number().integer().min(0).required(),
+    idempotencyKey: Joi.string().trim().min(1).max(100).required(),
+    items: Joi.array().items(billItemSchema).min(1).required(),
+    payment: Joi.object({
+        amount: Joi.number().positive().required(),
+        method: Joi.string().valid("cash", "card", "online").required(),
+        reference: Joi.string().allow("").max(100),
+    }),
+    note: Joi.string().allow("").max(200),
 });
 
 export const holdBillSchema = Joi.object({

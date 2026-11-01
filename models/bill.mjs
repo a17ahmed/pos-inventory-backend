@@ -63,8 +63,40 @@ const billItemSchema = new Schema({
     returnedQty: { type: Number, default: 0 },
     remainingQty: { type: Number, default: 0 },
     returnedProfit: { type: Number, default: 0 },
-    netProfit: { type: Number, default: 0 }
+    netProfit: { type: Number, default: 0 },
+
+    // "Add to today's bill": 0 = sold with the original bill; N = added in revision N
+    revision: { type: Number, default: 0 },
+    addedAt: { type: Date, default: null },
+    addedBy: { type: String, default: "" }
 }, { _id: true });
+
+// One "add items to today's bill" change (POST /bill/:id/add-items)
+const billRevisionSchema = new Schema({
+    number: { type: Number, required: true },
+    at: { type: Date, default: Date.now },
+    by: { type: Schema.Types.ObjectId, default: null },
+    byName: { type: String, default: "" },
+    items: [{
+        _id: false,
+        itemId: { type: Schema.Types.ObjectId },
+        product: { type: Schema.Types.ObjectId, ref: "Product", default: null },
+        name: { type: String },
+        qty: { type: Number },
+        price: { type: Number },
+        discountAmount: { type: Number, default: 0 },
+        lineTotal: { type: Number, default: 0 },
+    }],
+    addedTotal: { type: Number, default: 0 },
+    totalBefore: { type: Number, default: 0 },
+    totalAfter: { type: Number, default: 0 },
+    dueBefore: { type: Number, default: 0 },
+    dueAfter: { type: Number, default: 0 },
+    paymentAmount: { type: Number, default: 0 },
+    paymentMethod: { type: String, default: "" },
+    note: { type: String, default: "" },
+    idempotencyKey: { type: String, default: "" },
+}, { _id: false });
 
 const billSchema = new Schema(
     {
@@ -113,6 +145,10 @@ const billSchema = new Schema(
         // Discount totals (auto-calculated)
         totalItemDiscount: { type: Number, default: 0 },
         totalDiscount: { type: Number, default: 0 },
+
+        // "Add to today's bill" history (revision 0 = the original sale)
+        revisionCount: { type: Number, default: 0 },
+        revisions: { type: [billRevisionSchema], default: [] },
 
         // Discount history - tracks who gave what discount and when
         discountHistory: [{
