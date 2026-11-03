@@ -484,7 +484,7 @@ export const createClosing = async (req, res) => {
                 ...withCounts,
                 closingNumber,
                 business: businessId,
-                closedBy: { id: req.user.id, name: req.user.name || "Staff" },
+                closedBy: { id: req.user.id, name: req.user.adminId ? "Admin" : (req.user.name || "Staff") },
                 closedAt: new Date(),
                 notes: countedNote || "",
             });

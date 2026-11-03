@@ -2,6 +2,9 @@ import express from 'express';
 import { validate } from '../middleware/validate.mjs';
 import { registerBusinessSchema, updateBusinessSchema } from '../middleware/validationSchemas.mjs';
 import { registerBusiness, getBusinessById, updateBusiness } from '../controllers/business.mjs';
+import { isPlatformToken } from '../middleware/platformAuth.mjs';
+import { checkBusinessStatus } from '../middleware/businessStatus.mjs';
+import { trackUsage } from '../middleware/usageTracker.mjs';
 
 const businessRouter = express.Router();
 
@@ -31,6 +34,7 @@ const requireAuth = (req, res, next) => {
         }
         const token = authHeader.split('Bearer ')[1];
         const decoded = jwt.verify(token, publicKey);
+        if (isPlatformToken(decoded)) return res.status(401).json({ message: 'Invalid token', code: 'TOKEN_INVALID' });
         req.user = {
             id: decoded.id || decoded.adminId,
             name: decoded.name || null,
@@ -38,7 +42,8 @@ const requireAuth = (req, res, next) => {
             adminId: decoded.adminId,
             employeeId: decoded.employeeId,
             businessId: decoded.businessId,
-            role: decoded.role || (decoded.adminId ? 'admin' : 'employee')
+            role: decoded.role || (decoded.adminId ? 'admin' : 'employee'),
+            iat: decoded.iat
         };
         next();
     } catch (error) {
@@ -47,7 +52,7 @@ const requireAuth = (req, res, next) => {
 };
 
 // Protected routes - require authentication
-businessRouter.get('/:id', requireAuth, getBusinessById);
-businessRouter.patch('/:id', requireAuth, validate(updateBusinessSchema), updateBusiness);
+businessRouter.get('/:id', requireAuth, checkBusinessStatus, trackUsage, getBusinessById);
+businessRouter.patch('/:id', requireAuth, checkBusinessStatus, trackUsage, validate(updateBusinessSchema), updateBusiness);
 
 export default businessRouter;

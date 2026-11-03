@@ -1,5 +1,7 @@
 import Employee from '../models/employee.mjs';
 import RefreshToken from '../models/refreshToken.mjs';
+import { getBusinessStatus, blockedResponse } from '../middleware/businessStatus.mjs';
+import { recordUsage } from '../middleware/usageTracker.mjs';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import fs from 'fs';
@@ -21,7 +23,7 @@ export const employeeLogin = async (req, res) => {
         }
 
         const employee = await Employee.findOne({ employeeId: employeeId.toLowerCase() })
-            .populate('business');
+            .populate('business', '-subscription.notes -subscription.history -subscription.monthlyFee');
 
         if (!employee) {
             return res.status(401).json({ message: 'Invalid credentials' });
@@ -37,6 +39,13 @@ export const employeeLogin = async (req, res) => {
             return res.status(401).json({ message: 'Invalid credentials' });
         }
 
+        // Business blocked by the platform (e.g. unpaid) → no token
+        const status = await getBusinessStatus(employee.business?._id);
+        if (status?.status === 'blocked') {
+            recordUsage(employee.business._id, { blockedRequests: 1 });
+            return res.status(403).json(blockedResponse(status));
+        }
+
         const token = jwt.sign({
             id: employee._id,
             name: employee.name,
@@ -49,7 +58,9 @@ export const employeeLogin = async (req, res) => {
         });
 
         employee.token = token;
+        employee.lastLoginAt = new Date();
         await employee.save();
+        recordUsage(employee.business._id, { logins: 1 }, { userId: employee._id });
 
         // Issue refresh token
         const refreshTokenData = await RefreshToken.createToken({

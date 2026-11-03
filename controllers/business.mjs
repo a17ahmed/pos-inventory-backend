@@ -12,6 +12,9 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
+// Platform-only fields a shop never sees (internal notes, block history)
+const PLATFORM_PRIVATE = '-subscription.notes -subscription.history -subscription.monthlyFee';
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const privateKey = fs.readFileSync(path.resolve(__dirname, '../private.key'), 'utf-8');
@@ -146,7 +149,9 @@ export const getBusinessById = async (req, res) => {
             return res.status(403).json({ message: 'Access denied' });
         }
 
-        const business = await Business.findById(id).populate('businessType', 'name code icon features');
+        const business = await Business.findById(id)
+            .select(PLATFORM_PRIVATE)
+            .populate('businessType', 'name code icon features');
 
         if (!business) {
             return res.status(404).json({ message: 'Business not found' });
@@ -172,6 +177,7 @@ export const updateBusiness = async (req, res) => {
         const updates = req.body;
 
         const business = await Business.findByIdAndUpdate(id, updates, { new: true })
+            .select(PLATFORM_PRIVATE)
             .populate('businessType', 'name code icon');
 
         if (!business) {

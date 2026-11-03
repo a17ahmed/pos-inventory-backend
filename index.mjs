@@ -63,6 +63,12 @@ import { authorize } from './middleware/rbac.mjs';
 // Access control middleware (permission-based, cached)
 import { accessControl } from './middleware/accessControl.mjs';
 
+// Platform (software owner) admin panel + per-business block / usage tracking
+import platformRouter from './routes/platform.mjs';
+import { checkBusinessStatus, accountStatus } from './middleware/businessStatus.mjs';
+import { jwtAuth } from './middleware/jwtAuth.mjs';
+import { trackUsage } from './middleware/usageTracker.mjs';
+
 // MONGODB CONNECTIVITY with retry
 const uri = process.env.MONGODB_URI;
 const connectWithRetry = async () => {
@@ -136,43 +142,7 @@ const initializeCounters = async () => {
 
 await initializeCounters();
 
-// JWT verification middleware
-const jwtAuth = (req, res, next) => {
-    try {
-        const authHeader = req.get("Authorization");
-        if (!authHeader || !authHeader.startsWith('Bearer ')) {
-            return res.status(401).json({ message: 'Authentication required' });
-        }
-
-        const token = authHeader.split('Bearer ')[1];
-        const decoded = jwt.verify(token, publicKey);
-
-        // Accept both admin and employee tokens
-        if (decoded.adminId || decoded.email || decoded.employeeId || decoded.id) {
-            req.user = {
-                id: decoded.id || decoded.adminId,
-                name: decoded.name || null,
-                email: decoded.email,
-                adminId: decoded.adminId,
-                employeeId: decoded.employeeId,
-                businessId: decoded.businessId,
-                role: decoded.role || (decoded.adminId ? 'admin' : 'employee')
-            };
-            next();
-        } else {
-            res.status(401).json({ message: 'Invalid token' });
-        }
-    } catch (error) {
-        console.log('[Auth Middleware] JWT Error:', error.name, '-', error.message);
-        if (error.name === 'TokenExpiredError') {
-            return res.status(401).json({ message: 'Token expired', code: 'TOKEN_EXPIRED' });
-        }
-        if (error.name === 'JsonWebTokenError') {
-            return res.status(401).json({ message: 'Invalid token', code: 'TOKEN_INVALID' });
-        }
-        res.status(401).json({ message: 'Authentication failed' });
-    }
-};
+// JWT verification middleware → middleware/jwtAuth.mjs
 
 // CORS configuration - restrict origins
 const allowedOrigins = (process.env.CORS_ORIGINS || '*').split(',').map(o => o.trim());
@@ -190,11 +160,22 @@ const corsOptions = {
         : true, // Allow all in development
     credentials: true,
     methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization']
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    // Lets the apps read the "payment due" warning on any response
+    exposedHeaders: ['X-Account-Status']
 };
 
-// Global rate limiter
+// Behind a proxy / load balancer, set TRUST_PROXY so req.ip is the real client:
+// a hop count ("1"), "loopback", or a comma-separated list of proxy IPs.
+// Unset = Express default (no proxy trusted). Never use "true".
+if (process.env.TRUST_PROXY) {
+    const v = process.env.TRUST_PROXY.trim();
+    app.set('trust proxy', /^\d+$/.test(v) ? Number(v) : v.split(',').map((s) => s.trim()));
+}
+
+// Global rate limiter (per IP). The platform panel has its own per-user limits.
 const limiter = rateLimit({
+    skip: (req) => req.path.startsWith('/platform/'),
     windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000,
     max: parseInt(process.env.RATE_LIMIT_MAX) || 100,
     standardHeaders: true,
@@ -226,7 +207,9 @@ app.use(helmet({
 // Request logger (testing only — remove before production)
 app.use((req, res, next) => {
     const start = Date.now();
-    const body = req.method !== 'GET' && req.body ? JSON.stringify(req.body, null, 2) : null;
+    const body = req.method !== 'GET' && req.body
+        ? JSON.stringify(req.body, (key, value) => (/password/i.test(key) ? '[hidden]' : value), 2)
+        : null;
     res.on('finish', () => {
         console.log(`\n[${req.method}] ${req.originalUrl} → ${res.statusCode} (${Date.now() - start}ms)`);
         if (body) console.log('Body:', body);
@@ -254,30 +237,40 @@ app.use("/auth", authLimiter, authRouter);
 app.use("/business-types", businessTypeRouter);
 app.use("/business", businessRouter);
 
+// Platform admin panel (software owner) — its own login and tokens
+app.use("/platform", platformRouter);
+
+// Every shop request: valid token → business not blocked → usage counted
+const shopAuth = [jwtAuth, checkBusinessStatus, trackUsage];
+
+// Account status for the shop apps' lock screen / warning banner.
+// Deliberately NOT behind checkBusinessStatus so it works while blocked.
+app.get("/account/status", jwtAuth, accountStatus);
+
 // Protected routes (require JWT + access control)
-app.use("/admin", jwtAuth, authorize('admin', 'owner'), adminRouter);
+app.use("/admin", ...shopAuth, authorize('admin', 'owner'), adminRouter);
 
 // Consolidated Admin/Owner dashboard analytics (v1) — replaces the 11
 // separate calls the dashboard used to fire on load with one aggregation
 // endpoint. Admin/Owner-only, same as /admin above.
-app.use("/v1/dashboard", jwtAuth, authorize('admin', 'owner'), dashboardRouter);
+app.use("/v1/dashboard", ...shopAuth, authorize('admin', 'owner'), dashboardRouter);
 
-app.use("/bill", jwtAuth, accessControl, billRouter);
-app.use("/employee", jwtAuth, accessControl, employeeRouter);
+app.use("/bill", ...shopAuth, accessControl, billRouter);
+app.use("/employee", ...shopAuth, accessControl, employeeRouter);
 
 // Inventory & Retail routes
-app.use("/product", jwtAuth, accessControl, productRouter);
-app.use("/customer", jwtAuth, accessControl, customerRouter);
+app.use("/product", ...shopAuth, accessControl, productRouter);
+app.use("/customer", ...shopAuth, accessControl, customerRouter);
 
 // Expense tracking routes
-app.use("/expense", jwtAuth, accessControl, expenseRouter);
-app.use("/vendor", jwtAuth, accessControl, vendorRouter);
-app.use("/supply", jwtAuth, accessControl, supplyRouter);
-app.use("/cashbook", jwtAuth, accessControl, cashbookRouter);
-app.use("/closing", jwtAuth, accessControl, closingRouter);
+app.use("/expense", ...shopAuth, accessControl, expenseRouter);
+app.use("/vendor", ...shopAuth, accessControl, vendorRouter);
+app.use("/supply", ...shopAuth, accessControl, supplyRouter);
+app.use("/cashbook", ...shopAuth, accessControl, cashbookRouter);
+app.use("/closing", ...shopAuth, accessControl, closingRouter);
 
 // Access control management (admin only, no accessControl middleware needed - uses RBAC)
-app.use("/access", jwtAuth, accessRouter);
+app.use("/access", ...shopAuth, accessRouter);
 
 // Global error handler (catches malformed JSON, etc.)
 app.use((err, req, res, next) => {

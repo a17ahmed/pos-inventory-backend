@@ -26,6 +26,8 @@ const adminSchema = new Schema(
         token: String,
         otp: String,
         otpExpiry: Date,
+        lastLoginAt: { type: Date, default: null },
+        lastActiveAt: { type: Date, default: null },
     },
     { timestamps: true }
 )
