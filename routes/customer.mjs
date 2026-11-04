@@ -18,6 +18,7 @@ import {
     collectFromCustomer,
     searchCustomers
 } from '../controllers/customer.mjs';
+import { getCustomerStatement, getPendingBills } from '../controllers/customerStatement.mjs';
 import {
     getCustomerRates,
     upsertCustomerRate,
@@ -32,6 +33,8 @@ router.get('/summary', getCustomerSummary);
 router.post('/', validate(createCustomerSchema), createOrGetCustomer);
 router.get('/', getCustomers);
 router.get('/:id/ledger', getCustomerLedger);
+router.get('/:id/statement', getCustomerStatement);
+router.get('/:id/pending-bills', getPendingBills);
 router.post('/:id/collect', validate(collectFromCustomerSchema), collectFromCustomer);
 router.get('/:id/rates', getCustomerRates);
 router.put('/:id/rates', validate(replaceCustomerRatesSchema), replaceCustomerRates);

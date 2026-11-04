@@ -25,6 +25,8 @@ const employeeSchema = new Schema({
     token: {
         type: String
     },
+    lastLoginAt: { type: Date, default: null },
+    lastActiveAt: { type: Date, default: null },
     business: {
         type: Schema.Types.ObjectId,
         ref: "Business",

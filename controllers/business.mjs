@@ -1,7 +1,7 @@
 import 'dotenv/config';
 
 import mongoose from 'mongoose';
-import Business from '../models/business.mjs';
+import Business, { SHOP_HIDDEN_BUSINESS_FIELDS } from '../models/business.mjs';
 import Admin from '../models/admin.mjs';
 import BusinessType from '../models/businessType.mjs';
 
@@ -146,7 +146,9 @@ export const getBusinessById = async (req, res) => {
             return res.status(403).json({ message: 'Access denied' });
         }
 
-        const business = await Business.findById(id).populate('businessType', 'name code icon features');
+        const business = await Business.findById(id)
+            .select(SHOP_HIDDEN_BUSINESS_FIELDS)
+            .populate('businessType', 'name code icon features');
 
         if (!business) {
             return res.status(404).json({ message: 'Business not found' });
@@ -172,6 +174,7 @@ export const updateBusiness = async (req, res) => {
         const updates = req.body;
 
         const business = await Business.findByIdAndUpdate(id, updates, { new: true })
+            .select(SHOP_HIDDEN_BUSINESS_FIELDS)
             .populate('businessType', 'name code icon');
 
         if (!business) {

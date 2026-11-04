@@ -1,4 +1,5 @@
 import Joi from "joi";
+import { ADJUSTMENT_REASON_CODES, NOTE_MAX_LENGTH } from "../utils/stockAdjustment.mjs";
 
 const objectId = Joi.string().regex(/^[0-9a-fA-F]{24}$/, "valid ObjectId");
 
@@ -128,6 +129,7 @@ export const updateBusinessSettingsSchema = Joi.object({
         requireTableForDineIn: Joi.boolean(),
         autoSendToKitchen: Joi.boolean(),
         allowSellBelowCost: Joi.boolean(),
+        allowBillAmend: Joi.boolean(),
     }),
     cashTaxRate: Joi.number().min(0).max(100),
     cardTaxRate: Joi.number().min(0).max(100),
@@ -256,8 +258,35 @@ export const updateProductSchema = Joi.object({
 });
 
 export const updateStockSchema = Joi.object({
-    quantity: Joi.number().required(),
-    operation: Joi.string().valid("add", "subtract", "set").required(),
+    operation: Joi.string().valid("add", "subtract", "set").required()
+        .messages({ "any.required": "Operation is required", "any.only": "Operation must be add, subtract or set" }),
+    quantity: Joi.number().integer().required()
+        .when("operation", {
+            is: "set",
+            then: Joi.number().min(0).messages({ "number.min": "Quantity can't be negative" }),
+            otherwise: Joi.number().greater(0).messages({ "number.greater": "Quantity must be more than 0" }),
+        })
+        .messages({
+            "any.required": "Quantity is required",
+            "number.base": "Quantity must be a number",
+            "number.integer": "Quantity must be a whole number",
+        }),
+    reason: Joi.string().empty(Joi.valid("", null)).valid(...ADJUSTMENT_REASON_CODES).required()
+        .messages({
+            "any.required": "Reason is required",
+            "string.empty": "Reason is required",
+            "string.base": "Reason is required",
+            "any.only": `Reason must be one of: ${ADJUSTMENT_REASON_CODES.join(", ")}`,
+        }),
+    note: Joi.string().trim().max(NOTE_MAX_LENGTH).allow("")
+        .when("reason", { is: "other", then: Joi.string().trim().min(1).required() })
+        .messages({
+            "any.required": 'A note is required when the reason is Other',
+            "string.empty": 'A note is required when the reason is Other',
+            "string.min": 'A note is required when the reason is Other',
+            "string.max": `Note can be at most ${NOTE_MAX_LENGTH} characters`,
+            "string.base": "Note must be text",
+        }),
 });
 
 export const bulkUpdateStockSchema = Joi.object({
@@ -470,6 +499,21 @@ export const createBillSchema = Joi.object({
     notes: Joi.string().allow(""),
     holdNote: Joi.string().allow(""),
     idempotencyKey: Joi.string().allow(""),
+});
+
+// Add items to a customer's credit bill from today. `revision` = the bill's
+// revisionCount the POS loaded (stale screen → 409).
+export const addBillItemsSchema = Joi.object({
+    customer: objectId.required(),
+    revision: Joi.number().integer().min(0).required(),
+    idempotencyKey: Joi.string().trim().min(1).max(100).required(),
+    items: Joi.array().items(billItemSchema).min(1).required(),
+    payment: Joi.object({
+        amount: Joi.number().positive().required(),
+        method: Joi.string().valid("cash", "card", "online").required(),
+        reference: Joi.string().allow("").max(100),
+    }),
+    note: Joi.string().allow("").max(200),
 });
 
 export const holdBillSchema = Joi.object({

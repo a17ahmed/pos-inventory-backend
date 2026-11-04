@@ -9,6 +9,7 @@ import {
     standaloneRefundSchema,
     addPaymentSchema,
     updateBillSchema,
+    addBillItemsSchema,
 } from "../middleware/validationSchemas.mjs";
 import {
     createBill,
@@ -41,6 +42,8 @@ import {
     discountReport,
     returnAnalysis,
     salesTimeline,
+    getOpenBillsForCustomer,
+    addItemsToBill,
 } from "../controllers/bill.mjs";
 
 const billRouter = express.Router();
@@ -79,6 +82,10 @@ billRouter.post("/:id/cancel", validate(cancelSaleBillSchema), cancelSaleBill);
 
 // ─── Payments ────────────────────────────────────────────────
 billRouter.post("/:id/payment", validate(addPaymentSchema), addPayment);
+
+// ─── Add items to a customer's credit bill from today ───────
+billRouter.get("/open-for-customer/:customerId", getOpenBillsForCustomer);
+billRouter.post("/:id/add-items", validate(addBillItemsSchema), addItemsToBill);
 
 // ─── Core CRUD ───────────────────────────────────────────────
 billRouter.post("/", validate(createBillSchema), createBill);

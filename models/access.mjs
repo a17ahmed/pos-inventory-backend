@@ -23,7 +23,9 @@ const accessSchema = new Schema(
                 // Complete a bill where an item discount exceeds maxDiscountPercent
                 sellBeyondLimit: { type: Boolean, default: false },
                 // Cancel a completed sale bill (same day only unless admin)
-                cancelBill: { type: Boolean, default: false }
+                cancelBill: { type: Boolean, default: false },
+                // Add items to a customer's credit bill from today
+                amendBill: { type: Boolean, default: true }
             },
             pendingBills: {
                 view: { type: Boolean, default: true },

@@ -229,7 +229,8 @@ export const getCustomerRates = async (req, res) => {
             });
         }
 
-        if (missing.length > 0) {
+        // The platform admin panel is read-only: it must never change shop data
+        if (missing.length > 0 && !req.user.platform) {
             // Best-effort cleanup; the response is already correct without it
             Customer.updateOne(
                 { _id: customer._id, business: req.user.businessId },

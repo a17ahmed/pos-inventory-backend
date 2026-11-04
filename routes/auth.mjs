@@ -6,6 +6,7 @@ import { fileURLToPath } from 'url';
 import Admin from '../models/admin.mjs';
 import Employee from '../models/employee.mjs';
 import RefreshToken from '../models/refreshToken.mjs';
+import { getBusinessStatus, blockedResponse } from '../middleware/businessStatus.mjs';
 import { validate } from '../middleware/validate.mjs';
 import { refreshTokenSchema, logoutSchema } from '../middleware/validationSchemas.mjs';
 
@@ -23,6 +24,18 @@ authRouter.post('/refresh', validate(refreshTokenSchema), async (req, res) => {
     try {
         const { refreshToken } = req.body;
         console.log('[Auth Refresh] Request received');
+
+        // Blocked business → refuse without rotating (the session works again after unblock)
+        const pending = await RefreshToken.findOne({ token: refreshToken }).select('businessId createdAt').lean();
+        if (pending?.businessId) {
+            const status = await getBusinessStatus(pending.businessId);
+            if (status?.status === 'blocked') return res.status(403).json(blockedResponse(status));
+            // Issued before the platform ended this shop's sessions → log in again
+            if (status?.sessionsRevokedAt && new Date(pending.createdAt) <= new Date(status.sessionsRevokedAt)) {
+                await RefreshToken.deleteOne({ token: refreshToken });
+                return res.status(401).json({ message: 'Your session has ended. Please log in again.', code: 'SESSION_REVOKED' });
+            }
+        }
 
         console.log('[Auth Refresh] Verifying and rotating token...');
         // Verify and rotate (deletes old token, returns user info)

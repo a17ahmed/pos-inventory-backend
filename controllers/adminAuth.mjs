@@ -2,6 +2,9 @@ import 'dotenv/config';
 
 import Admin from '../models/admin.mjs';
 import RefreshToken from '../models/refreshToken.mjs';
+import { SHOP_HIDDEN_BUSINESS_FIELDS } from '../models/business.mjs';
+import { getBusinessStatus, blockedResponse } from '../middleware/businessStatus.mjs';
+import { recordUsage } from '../middleware/usageTracker.mjs';
 
 import jwt from 'jsonwebtoken';
 
@@ -49,6 +52,7 @@ const login = async (req, res) => {
         const getAdmin = await Admin.findOne({ email: req.body.email })
             .populate({
                 path: 'business',
+                select: SHOP_HIDDEN_BUSINESS_FIELDS,
                 populate: {
                     path: 'businessType',
                     select: 'name code icon features'
@@ -63,6 +67,15 @@ const login = async (req, res) => {
         const isAuthAdmin = await bcrypt.compare(req.body.password, getAdmin.password);
 
         if (isAuthAdmin) {
+            // Business blocked by the platform (e.g. unpaid) → no token
+            if (getAdmin.business) {
+                const status = await getBusinessStatus(getAdmin.business._id);
+                if (status?.status === 'blocked') {
+                    recordUsage(getAdmin.business._id, { blockedRequests: 1 });
+                    return res.status(403).json(blockedResponse(status));
+                }
+            }
+
             let token = jwt.sign({
                 email: req.body.email,
                 adminId: getAdmin._id,
@@ -74,7 +87,9 @@ const login = async (req, res) => {
             });
 
             getAdmin.token = token;
+            getAdmin.lastLoginAt = new Date();
             await getAdmin.save();
+            if (getAdmin.business) recordUsage(getAdmin.business._id, { logins: 1 }, { userId: getAdmin._id });
 
             // Issue refresh token
             const refreshTokenData = await RefreshToken.createToken({

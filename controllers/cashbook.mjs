@@ -1,6 +1,7 @@
 import mongoose from 'mongoose';
 import CashBook from '../models/cashbook.mjs';
 import Counter from '../models/counter.mjs';
+import { startOfDay, endOfDay, toLocalDateString, getTimezone } from '../utils/dateHelpers.mjs';
 
 // ═══════════════════════════════════════════════════════════════
 // CORE HELPER — called by other controllers inside transactions
@@ -165,6 +166,88 @@ export const getCurrentBalance = async (req, res) => {
     }
 };
 
+const round2 = (x) => Math.round((x || 0) * 100) / 100;
+const sumDir = (dir) => ({ $sum: { $cond: [{ $eq: ['$direction', dir] }, '$amount', 0] } });
+
+/** Balance of the last entry strictly before `date` (0 if none). */
+const balanceBefore = async (businessId, date) => {
+    const prev = await CashBook.findOne({ business: businessId, createdAt: { $lt: date } })
+        .sort({ createdAt: -1, entryNumber: -1 })
+        .select('runningBalance')
+        .lean();
+    return prev?.runningBalance ?? 0;
+};
+
+/**
+ * Opening / in / out / closing for each local day in `dayKeys` (YYYY-MM-DD),
+ * computed from every entry of those days.
+ */
+export const buildDaySummaries = async (businessId, dayKeys) => {
+    if (dayKeys.length === 0) return [];
+    const sorted = [...dayKeys].sort();
+    const first = startOfDay(sorted[0]);
+    const last = endOfDay(sorted[sorted.length - 1]);
+
+    const rows = await CashBook.aggregate([
+        { $match: { business: businessId, createdAt: { $gte: first, $lte: last } } },
+        { $sort: { createdAt: 1, entryNumber: 1 } },
+        {
+            $group: {
+                _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: getTimezone() } },
+                totalIn: sumDir('in'),
+                totalOut: sumDir('out'),
+                entryCount: { $sum: 1 },
+                closingBalance: { $last: '$runningBalance' },
+            },
+        },
+        { $sort: { _id: 1 } },
+    ]);
+
+    // Opening of each day = closing of the previous day that had entries
+    let carry = await balanceBefore(businessId, first);
+    const byDay = new Map();
+    for (const r of rows) {
+        byDay.set(r._id, {
+            date: r._id,
+            openingBalance: round2(carry),
+            closingBalance: round2(r.closingBalance),
+            totalIn: round2(r.totalIn),
+            totalOut: round2(r.totalOut),
+            entryCount: r.entryCount,
+        });
+        carry = r.closingBalance;
+    }
+    return sorted.map((k) => byDay.get(k)).filter(Boolean);
+};
+
+/** Opening / in / out / closing for a whole date range (null = unbounded). */
+export const buildRangeSummary = async (businessId, from, to) => {
+    const createdAt = {};
+    if (from) createdAt.$gte = from;
+    if (to) createdAt.$lte = to;
+    const match = { business: businessId, ...(from || to ? { createdAt } : {}) };
+
+    const [opening, [totals], lastEntry] = await Promise.all([
+        from ? balanceBefore(businessId, from) : 0,
+        CashBook.aggregate([
+            { $match: match },
+            { $group: { _id: null, totalIn: sumDir('in'), totalOut: sumDir('out'), entryCount: { $sum: 1 } } },
+        ]),
+        CashBook.findOne(match).sort({ createdAt: -1, entryNumber: -1 }).select('runningBalance').lean(),
+    ]);
+
+    return {
+        from,
+        to,
+        openingBalance: round2(opening),
+        totalIn: round2(totals?.totalIn),
+        totalOut: round2(totals?.totalOut),
+        net: round2((totals?.totalIn || 0) - (totals?.totalOut || 0)),
+        closingBalance: round2(lastEntry ? lastEntry.runningBalance : opening),
+        entryCount: totals?.entryCount || 0,
+    };
+};
+
 /**
  * GET /cashbook
  * Paginated cashbook ledger with filters.
@@ -206,53 +289,27 @@ export const getCashBook = async (req, res) => {
             CashBook.countDocuments(match),
         ]);
 
-        // Build daily summary with auto-carried opening/closing balances
-        const dailySummary = {};
+        // Day figures (opening / in / out / closing) are worked out from ALL of
+        // each day's entries in the database — not just the ones on this page —
+        // so a day split across pages, or a type filter, never skews them. The
+        // page only decides which rows are listed.
+        const dayKeysOnPage = [...new Set(entries.map((e) => toLocalDateString(new Date(e.createdAt))))];
+        const dailySummary = await buildDaySummaries(businessId, dayKeysOnPage);
 
-        if (entries.length > 0) {
-            // Get the closing balance from the day before the first entry on this page
-            const firstEntry = entries[0];
-            const firstDayStart = new Date(firstEntry.createdAt);
-            firstDayStart.setHours(0, 0, 0, 0);
-
-            const prevEntry = await CashBook.findOne({
-                business: businessId,
-                createdAt: { $lt: firstDayStart },
-            })
-                .sort({ createdAt: -1, entryNumber: -1 })
-                .select('runningBalance')
-                .lean();
-
-            let carryForwardBalance = prevEntry?.runningBalance ?? 0;
-
-            for (const entry of entries) {
-                const d = new Date(entry.createdAt);
-                const dayKey = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-
-                if (!dailySummary[dayKey]) {
-                    dailySummary[dayKey] = {
-                        date: dayKey,
-                        openingBalance: carryForwardBalance,
-                        closingBalance: entry.runningBalance,
-                        totalIn: 0,
-                        totalOut: 0,
-                        entryCount: 0,
-                    };
-                }
-
-                const day = dailySummary[dayKey];
-                day.closingBalance = entry.runningBalance;
-                day.entryCount++;
-                if (entry.direction === 'in') day.totalIn += entry.amount;
-                else day.totalOut += entry.amount;
-
-                carryForwardBalance = entry.runningBalance;
-            }
+        // Totals for the whole selected range (all entry types = real cash)
+        const rangeSummary = await buildRangeSummary(businessId, match.createdAt?.$gte || null, match.createdAt?.$lte || null);
+        if (match.type) {
+            const [t] = await CashBook.aggregate([
+                { $match: match },
+                { $group: { _id: null, totalIn: sumDir('in'), totalOut: sumDir('out'), entryCount: { $sum: 1 } } },
+            ]);
+            rangeSummary.type = { type: match.type, totalIn: round2(t?.totalIn), totalOut: round2(t?.totalOut), entryCount: t?.entryCount || 0 };
         }
 
         res.json({
             entries,
-            dailySummary: Object.values(dailySummary),
+            dailySummary,
+            rangeSummary,
             pagination: {
                 page: parseInt(page),
                 limit: parseInt(limit),
