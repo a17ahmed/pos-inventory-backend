@@ -273,6 +273,23 @@ const restoreStock = async (items, businessId, billRef = {}, session = null) => 
     }
 };
 
+/**
+ * The bill line a returned item came from. Returns saved since the line is
+ * recorded (`itemId`) match exactly. Older returns fall back to the product
+ * (or name), preferring a line that really has that many returned — the same
+ * product can be on several lines.
+ */
+const returnLineFor = (bill, returnItem) => {
+    if (returnItem.itemId) {
+        const exact = bill.items.id(returnItem.itemId);
+        if (exact) return exact;
+    }
+    const same = bill.items.filter((i) => (returnItem.product
+        ? i.product?.toString() === returnItem.product.toString()
+        : i.name.toLowerCase() === returnItem.name.toLowerCase()));
+    return same.find((i) => (i.returnedQty || 0) >= returnItem.quantity) || same[0];
+};
+
 // Who triggered a store-credit settlement (stored on the credit payment)
 const settlementActor = (req) => ({
     id: req.user.id,
@@ -1436,6 +1453,7 @@ export const processReturn = async (req, res) => {
                 totalProfitLost += profitLost;
 
                 returnItems.push({
+                    itemId: billItem._id,
                     product: billItem.product || null,
                     name: billItem.name,
                     quantity: returnItem.quantity,
@@ -1759,11 +1777,12 @@ export const cancelReturn = async (req, res) => {
             // whatever credit is left after the cancel is settled again below.
             await unwindCreditFrom(bill, session);
 
+            // Find the bill line each returned item came from — before changing
+            // any returnedQty, so the lookup can't be thrown off by this loop.
+            const lines = returnEntry.items.map((returnItem) => [returnItem, returnLineFor(bill, returnItem)]);
+
             // Restore item returnedQty on the bill
-            for (const returnItem of returnEntry.items) {
-                const billItem = returnItem.product
-                    ? bill.items.find((i) => i.product?.toString() === returnItem.product.toString())
-                    : bill.items.find((i) => i.name.toLowerCase() === returnItem.name.toLowerCase());
+            for (const [returnItem, billItem] of lines) {
                 if (billItem) {
                     billItem.returnedQty = Math.max(0, billItem.returnedQty - returnItem.quantity);
                 }
@@ -1771,10 +1790,7 @@ export const cancelReturn = async (req, res) => {
 
             // Reverse stock restoration (deduct the stock that was restored during the return)
             const stockItems = [];
-            for (const returnItem of returnEntry.items) {
-                const billItem = returnItem.product
-                    ? bill.items.find((i) => i.product?.toString() === returnItem.product.toString())
-                    : bill.items.find((i) => i.name.toLowerCase() === returnItem.name.toLowerCase());
+            for (const [returnItem, billItem] of lines) {
                 if (billItem?.product) {
                     stockItems.push({
                         product: billItem.product,
@@ -2539,6 +2555,11 @@ const amendBlockReason = (bill, { todayStart, lastClosingAt }) => {
         return "Store closing was done after this bill. Make a new bill.";
     }
     if (bill.returnStatus === "full") return "This bill was fully returned. Make a new bill.";
+    // A flat bill discount is shared out by ratio; a return already refunded at
+    // the old ratio wouldn't add up once new items change it (leftover due).
+    if (bill.discountMode === "bill" && (bill.returns || []).length > 0) {
+        return "This bill has a bill discount and a return. Make a new bill.";
+    }
     if (Math.abs(bill.amountDue || 0) <= OPEN_DUE) return "This bill is fully paid. Make a new bill.";
     return null;
 };
@@ -2636,9 +2657,36 @@ export const getOpenBillsForCustomer = async (req, res) => {
  */
 export const addItemsToBill = async (req, res) => {
     try {
-        const { customer: customerId, revision, idempotencyKey, payment } = req.body;
+        const { customer: customerId, idempotencyKey } = req.body;
+        // Validated numbers may arrive as text ("1") — use them as numbers
+        const revision = Number(req.body.revision);
+        const payment = req.body.payment ? { ...req.body.payment, amount: Number(req.body.payment.amount) } : null;
+        const num = (v) => (v === undefined || v === null ? v : Number(v));
+        req.body.items = req.body.items.map((i) => ({
+            ...i, qty: num(i.qty), price: num(i.price), discountAmount: num(i.discountAmount), gst: num(i.gst), customerRate: num(i.customerRate),
+        }));
         const note = String(req.body.note || "").trim();
         const byName = req.user.adminId ? "Admin" : (req.user.name || "Staff");
+
+        if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+            return res.status(404).json({ message: "Bill not found" });
+        }
+
+        // Same save sent again (lost reply / offline retry) → "already done",
+        // before any other rule: a setting, permission or price that changed in
+        // between must not turn a retry into an error the cashier re-enters.
+        const alreadyDone = await Bill.findOne({
+            _id: req.params.id,
+            business: req.user.businessId,
+            "revisions.idempotencyKey": idempotencyKey,
+        });
+        if (alreadyDone) {
+            return res.status(409).json({
+                alreadyApplied: true,
+                message: `These items were already added to Bill #${alreadyDone.billNumber}`,
+                bill: redactProfitFields(alreadyDone, await canViewProfit(req)),
+            });
+        }
 
         const business = await Business.findById(req.user.businessId)
             .select("settings.allowBillAmend settings.allowSellBelowCost lastClosingAt")
@@ -2847,6 +2895,16 @@ export const addItemsToBill = async (req, res) => {
         } catch (txError) {
             if (session.inTransaction()) await session.abortTransaction();
             if (txError.errorLabels?.includes?.("TransientTransactionError") || txError.code === 112) {
+                // Two copies of the same save at once: if the other one went
+                // through, tell this one it's already done
+                const done = await Bill.findOne({ _id: req.params.id, "revisions.idempotencyKey": idempotencyKey });
+                if (done) {
+                    return res.status(409).json({
+                        alreadyApplied: true,
+                        message: `These items were already added to Bill #${done.billNumber}`,
+                        bill: redactProfitFields(done, await canViewProfit(req)),
+                    });
+                }
                 return res.status(409).json({ message: "This bill was just changed. Reload it and try again." });
             }
             throw txError;

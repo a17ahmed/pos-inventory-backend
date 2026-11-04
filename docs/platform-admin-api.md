@@ -49,7 +49,7 @@ Other sessions of this user end; **replace the stored token with the returned `t
 Per **panel user**, not per IP (all panel traffic comes from the panel's server, i.e. one IP):
 | What | Limit | Key |
 |---|---|---|
-| `POST /platform/auth/login` | 10 / 15 min | the email |
+| `POST /platform/auth/login` | 10 / 15 min per IP + email, and 100 / 15 min per IP | the caller's IP and the email |
 | every other `/platform/*` call | 3000 / 15 min | the signed-in panel user |
 
 On 429 the body is `{ message, code: "RATE_LIMITED" }` and the headers carry `Retry-After` (seconds)
@@ -162,7 +162,7 @@ Charts: Sales per day (bars) + Bills per day (line); Requests per day; Active us
 ```json
 {
   "date": "2026-11-01",
-  "bills": 143, "sales": 64200, "paid": 59000, "creditGiven": 5200, "profit": 9100, "discount": 300,
+  "bills": 143, "sales": 64200, "paid": 59000, "paidByStoreCredit": 400, "creditGiven": 5200, "profit": 9100, "discount": 300,
   "itemsSold": 610, "billsWithCustomer": 40, "firstBillAt": "…", "lastBillAt": "…",
   "cancelled": 1, "onHold": 2,
   "byHour": [{ "hour": 9, "bills": 12, "sales": 4300 }],
@@ -170,6 +170,8 @@ Charts: Sales per day (bars) + Bills per day (line); Requests per day; Active us
   "byPaymentMethod": [{ "method": "cash", "payments": 120, "amount": 52000 }]
 }
 ```
+`paid` and `byPaymentMethod` = **real money taken that day** on these bills (payments collected on a
+later day and store credit are left out); `paidByStoreCredit` = store credit moved in from other bills.
 `hour` is 0–23 Pakistan time (only hours with bills). `date` must be a real date (`2026-02-31` → 400).
 
 ### 4.4 `GET .../users` — users tab
@@ -274,7 +276,7 @@ UI: on the shop page show a status card with buttons (superadmin only):
   "pagination": { "page": 1, "limit": 50, "total": 120, "pages": 3, "hasMore": true }
 }
 ```
-Actions: `auth.login`, `auth.login_failed`, `auth.change_password`, `business.warn`, `business.clear_warning`,
+Actions (`auth.login_failed` is recorded only for existing panel accounts): `auth.login`, `auth.logout`, `auth.login_failed`, `auth.change_password`, `business.warn`, `business.clear_warning`,
 `business.block`, `business.unblock`, `business.update`, `business.revoke_sessions`, `admin.create`, `admin.update`.
 
 ---
@@ -285,7 +287,7 @@ Actions: `auth.login`, `auth.login_failed`, `auth.change_password`, `business.wa
 |---|---|---|
 | `GET /platform/admins` | | `{ admins: [{ id, name, email, role, isActive, lastLoginAt, createdAt }] }` |
 | `POST /platform/admins` | `{ name, email, password (≥8), role: "superadmin"\|"support" }` | 201; 409 email exists |
-| `PATCH /platform/admins/:adminId` | `{ name?, role?, isActive?, password? }` | 400 if it would leave no active superadmin |
+| `PATCH /platform/admins/:adminId` | `{ name?, role?, isActive? (true/false only), password? }` | 400 if it would leave no active superadmin; disabling, a role change or a password reset ends that user's sessions |
 
 ---
 
@@ -296,7 +298,7 @@ Not part of the panel, but the panel's actions show up here:
   `403 { "code": "BUSINESS_BLOCKED", "message": "Your account is suspended. <message>", "contact": "<contact>" }`;
   admin / employee login and token refresh return the same.
 - **Warning:** responses carry header `X-Account-Status: warning`.
-- **Revoked sessions:** `401 { "code": "SESSION_REVOKED" }` → log in again.
+- **Revoked sessions:** `401 { "code": "SESSION_REVOKED" }` on any request **and on token refresh** → log in again.
 - `GET /account/status` (shop token; works even when blocked) →
   `{ "status": "active"|"warning"|"blocked", "message", "contact", "paidUntil" }`
 

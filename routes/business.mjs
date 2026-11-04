@@ -52,7 +52,7 @@ const requireAuth = (req, res, next) => {
 };
 
 // Protected routes - require authentication
-businessRouter.get('/:id', requireAuth, checkBusinessStatus, trackUsage, getBusinessById);
-businessRouter.patch('/:id', requireAuth, checkBusinessStatus, trackUsage, validate(updateBusinessSchema), updateBusiness);
+businessRouter.get('/:id', requireAuth, trackUsage, checkBusinessStatus, getBusinessById);
+businessRouter.patch('/:id', requireAuth, trackUsage, checkBusinessStatus, validate(updateBusinessSchema), updateBusiness);
 
 export default businessRouter;

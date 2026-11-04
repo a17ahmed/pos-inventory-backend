@@ -1,7 +1,7 @@
 import mongoose from 'mongoose';
 import Customer from '../models/customer.mjs';
 import Bill from '../models/bill.mjs';
-import { startOfToday, startOfMonth, startOfWeek, startOfDay, endOfDay } from '../utils/dateHelpers.mjs';
+import { startOfToday, startOfMonth, startOfWeek, startOfDay, endOfDay, toLocalDateString } from '../utils/dateHelpers.mjs';
 
 // ─── Customer statement (paged ledger) ──────────────────────────────────────
 // The ledger isn't stored: it's built from the customer's bills (each bill,
@@ -25,6 +25,7 @@ const SETTLED = 0.005; // balance at or below this = customer owes nothing
 const TYPES = ['all', 'bill', 'payment', 'return', 'cancelled'];
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 200;
+const MAX_PAGE = 100000; // a bigger page number would overflow the database skip
 
 const round2 = (x) => Math.round((x || 0) * 100) / 100;
 const isObjectId = (id) => mongoose.Types.ObjectId.isValid(id) && String(new mongoose.Types.ObjectId(id)) === String(id);
@@ -66,6 +67,10 @@ export const resolvePeriod = (period, fromStr, toStr) => {
             }
             const from = startOfDay(fromStr);
             const to = endOfDay(toStr);
+            // 2026-02-31 would silently roll over to 3 March
+            if (toLocalDateString(from) !== fromStr || toLocalDateString(to) !== toStr) {
+                throw Object.assign(new Error('from and to must be real dates (YYYY-MM-DD)'), { status: 400 });
+            }
             if (from > to) throw Object.assign(new Error('"from" must be on or before "to"'), { status: 400 });
             return { from, to };
         }
@@ -281,6 +286,13 @@ const eventStages = (customerId, businessId) => [
  *           'settled'       owes nothing now; settledAt = when it got to 0
  *           'noBalance'     never owed anything → all entries
  */
+// Store-credit moves show as a pair (credit_transfer +X, then the fromCredit
+// payment −X) that always nets to zero. Between the two lines the running
+// balance blips up by X, which is not real debt — so pair lines are never used
+// to decide "owed" or "zero" below.
+const IS_CREDIT_PAIR = { $or: [{ $eq: ['$kind', 'credit_transfer'] }, { $eq: ['$fromCredit', true] }] };
+const IS_REAL = { $not: [IS_CREDIT_PAIR] };
+
 const findLastZero = async (customerId, businessId) => {
     const [r] = await Bill.aggregate([
         ...eventStages(customerId, businessId),
@@ -289,37 +301,42 @@ const findLastZero = async (customerId, businessId) => {
                 sortBy: { seq: 1 },
                 output: {
                     lastOwed: {
-                        $max: { $cond: [{ $gt: ['$balance', SETTLED] }, '$seq', 0] },
+                        $max: { $cond: [{ $and: [{ $gt: ['$balance', SETTLED] }, IS_REAL] }, '$seq', 0] },
                         window: { documents: ['unbounded', 'unbounded'] },
                     },
-                    lastSeq: { $max: '$seq', window: { documents: ['unbounded', 'unbounded'] } },
                 },
             },
         },
         {
             $facet: {
-                meta: [{ $limit: 1 }, { $project: { _id: 0, lastOwed: 1, lastSeq: 1 } }],
+                meta: [{ $limit: 1 }, { $project: { _id: 0, lastOwed: 1 } }],
+                // Balance after the last line = what the customer owes now
+                tail: [{ $sort: { seq: -1 } }, { $limit: 1 }, { $project: { _id: 0, balance: 1 } }],
                 zero: [
-                    { $match: { $expr: { $and: [{ $lte: ['$balance', SETTLED] }, { $lt: ['$seq', '$lastOwed'] }] } } },
+                    { $match: { $expr: { $and: [{ $lte: ['$balance', SETTLED] }, { $lt: ['$seq', '$lastOwed'] }, IS_REAL] } } },
                     { $sort: { seq: -1 } },
                     { $limit: 1 },
                     { $project: { _id: 0, seq: 1, date: 1 } },
                 ],
+                // First line after the last debt that brought the balance to 0 or below
                 settled: [
-                    { $match: { $expr: { $eq: ['$seq', { $add: ['$lastOwed', 1] }] } } },
+                    { $match: { $expr: { $and: [{ $gt: ['$seq', '$lastOwed'] }, { $lte: ['$balance', SETTLED] }] } } },
+                    { $sort: { seq: 1 } },
+                    { $limit: 1 },
                     { $project: { _id: 0, date: 1 } },
                 ],
             },
         },
     ]).allowDiskUse(true);
 
-    const { lastOwed = 0, lastSeq = 0 } = r?.meta[0] || {};
+    const lastOwed = r?.meta[0]?.lastOwed || 0;
     if (lastOwed === 0) return { zeroSeq: 0, zeroAt: null, status: 'noBalance', settledAt: null };
 
     const zero = r.zero[0];
     const zeroSeq = zero?.seq || 0;
     const zeroAt = zero?.date || null;
-    if (lastOwed < lastSeq) {
+    const owesNow = (r.tail[0]?.balance || 0) > SETTLED;
+    if (!owesNow) {
         return { zeroSeq, zeroAt, status: 'settled', settledAt: r.settled[0]?.date || null };
     }
     return { zeroSeq, zeroAt, status: zeroSeq ? 'open' : 'neverSettled', settledAt: null };
@@ -408,7 +425,7 @@ export const getCustomerStatement = async (req, res) => {
             return res.status(err.status || 400).json({ message: err.message });
         }
 
-        const page = Math.max(parseInt(req.query.page) || 1, 1);
+        const page = Math.min(Math.max(parseInt(req.query.page) || 1, 1), MAX_PAGE);
         const limit = Math.min(Math.max(parseInt(req.query.limit) || DEFAULT_LIMIT, 1), MAX_LIMIT);
         const search = String(req.query.search || '').trim().replace(/[^0-9]/g, '');
 

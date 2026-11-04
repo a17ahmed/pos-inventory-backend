@@ -432,3 +432,78 @@ test("customer with no bills: empty, status noBalance", withBusiness(async (busi
     assert.deepEqual(r.entries, []);
     assert.equal(r.period.closingBalance, 0);
 }));
+
+// ═══ Since last zero + store-credit moves ═══════════════════════════════════
+
+/** Run the real store-credit settlement (as the app does after a return). */
+const settle = async (businessId, customerId) => {
+    const session = await mongoose.startSession();
+    try {
+        let moves;
+        await session.withTransaction(async () => {
+            moves = await settleCustomerCredit({ customerId, businessId, session, force: true });
+        });
+        return moves;
+    } finally {
+        await session.endSession();
+    }
+};
+
+test("since last zero ignores the credit-move blip: return credit paying another bill keeps that bill in view", withBusiness(async (businessId) => {
+    const customer = (await Customer.create({ business: businessId, name: "Blip", phone: uid() }))._id;
+    const a = await bill(businessId, customer, { total: 1000, at: at(10) });
+    await addPayment(a, 1000, at(9));                                    // 0 ← real last zero
+    const b = await bill(businessId, customer, { total: 1000, at: at(5) }); // owes 1,000
+    await addReturn(a, 1000, at(2));                                     // back to 0 (A in credit)
+    const moves = await settle(businessId, customer);                    // A's credit pays B → +1000 / −1000 pair
+    assert.equal(moves.length, 1);
+
+    const r = (await call(getCustomerStatement, businessId, customer)).body;
+    assert.equal(r.period.sinceZero.status, "settled");
+    assert.equal(r.period.openingBalance, 0);
+    assert.deepEqual(r.entries.map((e) => [e.type, e.billNumber]), [
+        ["bill", b.billNumber],
+        ["return", a.billNumber],
+        ["credit_transfer", a.billNumber],
+        ["payment", b.billNumber],
+    ], "Bill B and the return are shown, not only the credit pair");
+    assert.equal(r.period.closingBalance, 0);
+    assert.deepEqual(r.period.sinceZero.settledAt, at(2), "settled by the return");
+}));
+
+test("customer in credit buying less than the credit: never owed, the blip isn't a debt", withBusiness(async (businessId) => {
+    const customer = (await Customer.create({ business: businessId, name: "Credit", phone: uid() }))._id;
+    const a = await bill(businessId, customer, { total: 1000, paid: 1000, at: at(10) });
+    await addReturn(a, 1000, at(8));                                     // credit 1,000
+    await bill(businessId, customer, { total: 600, at: at(3) });         // −400
+    await settle(businessId, customer);                                  // pair +600 / −600
+
+    const r = (await call(getCustomerStatement, businessId, customer)).body;
+    assert.equal(r.period.sinceZero.status, "settled");
+    assert.equal(r.period.closingBalance, -400);
+    const all = (await call(getCustomerStatement, businessId, customer, { period: "all" })).body;
+    assert.deepEqual(r.entries.map((e) => e.id), all.entries.map((e) => e.id), "nothing hidden: the customer never owed after the start");
+}));
+
+test("still owing after a credit move: status open, not settled", withBusiness(async (businessId) => {
+    const customer = (await Customer.create({ business: businessId, name: "Owes", phone: uid() }))._id;
+    const a = await bill(businessId, customer, { total: 500, paid: 500, at: at(10) });   // 0
+    const b = await bill(businessId, customer, { total: 2000, at: at(6) });              // owes 2,000
+    await addReturn(a, 500, at(4));                                                      // 1,500
+    await settle(businessId, customer);                                                  // pair +500 / −500 → still 1,500
+
+    const r = (await call(getCustomerStatement, businessId, customer)).body;
+    assert.equal(r.period.sinceZero.status, "open");
+    assert.equal(r.period.closingBalance, 1500);
+    assert.ok(r.entries.some((e) => e.type === "bill" && e.billNumber === b.billNumber));
+}));
+
+test("statement input: impossible custom dates are 400; huge page numbers don't crash", withBusiness(async (businessId) => {
+    const { customer } = await setup(businessId);
+    const bad = await call(getCustomerStatement, businessId, customer, { period: "custom", from: "2026-02-31", to: "2026-03-05" });
+    assert.equal(bad.statusCode, 400);
+    assert.equal(bad.body.message, "from and to must be real dates (YYYY-MM-DD)");
+    const huge = await call(getCustomerStatement, businessId, customer, { period: "all", page: "100000000000000000000" });
+    assert.equal(huge.statusCode, 200);
+    assert.deepEqual(huge.body.entries, []);
+}));

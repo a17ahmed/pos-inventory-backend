@@ -85,11 +85,22 @@ const platformRouter = express.Router();
 // Rate limits are per panel user (and per email for sign-in), not per IP: all
 // panel traffic arrives from the panel's own server, i.e. one IP.
 const limitHeaders = { standardHeaders: true, legacyHeaders: false };
+// Sign-in: per IP + email (a stranger hammering your email from elsewhere
+// can't lock you out of the panel's own server) and per IP overall (stops
+// one source spraying random emails). Generous IP limit: the panel's server
+// is one IP for all panel users.
 const loginLimiter = rateLimit({
     ...limitHeaders,
     windowMs: 15 * 60 * 1000,
     max: parseInt(process.env.PLATFORM_LOGIN_RATE_LIMIT_MAX) || 10,
-    keyGenerator: (req) => `login:${String(req.body?.email || '').trim().toLowerCase()}`,
+    keyGenerator: (req) => `login:${req.ip}:${String(req.body?.email || '').trim().toLowerCase()}`,
+    message: { message: 'Too many sign-in attempts. Please try again later.', code: 'RATE_LIMITED' },
+});
+const loginIpLimiter = rateLimit({
+    ...limitHeaders,
+    windowMs: 15 * 60 * 1000,
+    max: parseInt(process.env.PLATFORM_LOGIN_IP_RATE_LIMIT_MAX) || 100,
+    keyGenerator: (req) => `login-ip:${req.ip}`,
     message: { message: 'Too many sign-in attempts. Please try again later.', code: 'RATE_LIMITED' },
 });
 const userLimiter = rateLimit({
@@ -101,7 +112,7 @@ const userLimiter = rateLimit({
 });
 
 // ── Auth ───────────────────────────────────────────────────────
-platformRouter.post('/auth/login', loginLimiter, platformLogin);
+platformRouter.post('/auth/login', loginIpLimiter, loginLimiter, platformLogin);
 
 platformRouter.use(platformAuth, userLimiter);
 platformRouter.post('/auth/logout', platformLogout);

@@ -290,7 +290,8 @@ const deleteProduct = async (req, res) => {
 // in one transaction. No money moves (no cash book / expense / profit).
 const updateStock = async (req, res) => {
     try {
-        const { quantity, operation, reason } = req.body; // operation: 'add', 'subtract', 'set'
+        const { operation, reason } = req.body; // operation: 'add', 'subtract', 'set'
+        const quantity = Number(req.body.quantity); // validated as a whole number; may arrive as "5"
         const note = String(req.body.note || '').trim();
 
         if (reason === 'other' && !note) {

@@ -2,6 +2,9 @@ import mongoose, { Schema } from "mongoose";
 
 // Return item schema (embedded in each return entry)
 const returnItemSchema = new Schema({
+    // The bill line this came back from (a bill can have the same product on
+    // several lines, e.g. after "add to today's bill"). null on older returns.
+    itemId: { type: Schema.Types.ObjectId, default: null },
     product: { type: Schema.Types.ObjectId, ref: "Product", default: null },
     name: { type: String, required: true },
     quantity: { type: Number, required: true, min: 1 },

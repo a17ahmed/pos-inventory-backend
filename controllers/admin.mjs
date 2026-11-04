@@ -1,5 +1,5 @@
 import Admin from '../models/admin.mjs';
-import Business from '../models/business.mjs';
+import Business, { SHOP_HIDDEN_BUSINESS_FIELDS } from '../models/business.mjs';
 import bcrypt from 'bcrypt';
 
 // GET ADMIN - only the admin's own profile
@@ -109,7 +109,7 @@ const updateBusinessSettings = async (req, res) => {
             businessId,
             { $set: updateData },
             { new: true }
-        );
+        ).select(SHOP_HIDDEN_BUSINESS_FIELDS);
 
         if (!business) {
             return res.status(404).json({ message: 'Business not found' });

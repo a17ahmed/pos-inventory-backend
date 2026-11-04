@@ -1,5 +1,6 @@
 import Employee from '../models/employee.mjs';
 import RefreshToken from '../models/refreshToken.mjs';
+import { SHOP_HIDDEN_BUSINESS_FIELDS } from '../models/business.mjs';
 import { getBusinessStatus, blockedResponse } from '../middleware/businessStatus.mjs';
 import { recordUsage } from '../middleware/usageTracker.mjs';
 import bcrypt from 'bcrypt';
@@ -23,7 +24,7 @@ export const employeeLogin = async (req, res) => {
         }
 
         const employee = await Employee.findOne({ employeeId: employeeId.toLowerCase() })
-            .populate('business', '-subscription.notes -subscription.history -subscription.monthlyFee');
+            .populate('business', SHOP_HIDDEN_BUSINESS_FIELDS);
 
         if (!employee) {
             return res.status(401).json({ message: 'Invalid credentials' });

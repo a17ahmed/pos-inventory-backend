@@ -24,7 +24,7 @@ import Counter from "../models/counter.mjs";
 import StockMovement from "../models/stockMovement.mjs";
 import Access from "../models/access.mjs";
 
-import { createBill, processReturn, cancelSaleBill, getOpenBillsForCustomer, addItemsToBill } from "../controllers/bill.mjs";
+import { createBill, processReturn, cancelReturn, cancelSaleBill, getOpenBillsForCustomer, addItemsToBill } from "../controllers/bill.mjs";
 import { accessControl, invalidateAccessCache } from "../middleware/accessControl.mjs";
 import { validate } from "../middleware/validate.mjs";
 import { addBillItemsSchema } from "../middleware/validationSchemas.mjs";
@@ -452,4 +452,96 @@ test("cancelling the bill later puts back stock for earlier AND added lines", wi
     assert.equal(await stockOf(ketchup), 50);
     assert.equal(await stockOf(mayo), 50);
     assert.equal(await balanceOf(ali), 0);
+}));
+
+// ═══ Review fixes ════════════════════════════════════════════════════════════
+
+test("retry of a save that already went through → alreadyApplied, even if a rule changed in between", withBusiness(async (businessId) => {
+    const ketchup = await product(businessId, "Ketchup", 150);
+    const box = await product(businessId, "Pizza box", 25);
+    const ali = await newCustomer(businessId);
+    const bill = await sale(businessId, ali, [line(ketchup, 2)]);
+
+    const first = await addItems(businessId, bill, ali, [line(box, 10)], { key: "lost-reply-1" });
+    assert.equal(first.statusCode, 200);
+
+    // reply lost; meanwhile the admin turns the feature off and changes the box price
+    await Business.updateOne({ _id: businessId }, { $set: { "settings.allowBillAmend": false } });
+    await Product.updateOne({ _id: box._id }, { $set: { costPrice: 30 } });
+
+    const retry = await addItems(businessId, bill, ali, [line(box, 10)], { key: "lost-reply-1" });
+    assert.equal(retry.statusCode, 409, JSON.stringify(retry.body));
+    assert.equal(retry.body.alreadyApplied, true);
+    assert.equal(retry.body.bill.total, 550);
+    assert.equal((await billOf(bill)).items.length, 2, "added once");
+    assert.equal(await stockOf(box), 40, "stock taken once");
+}));
+
+test("cancelling a return on a product that is on two lines fixes the right line", withBusiness(async (businessId) => {
+    const ketchup = await product(businessId, "Ketchup", 150);
+    const ali = await newCustomer(businessId);
+    const bill = await sale(businessId, ali, [line(ketchup, 2)]);           // morning line ×2
+    await addItems(businessId, bill, ali, [line(ketchup, 3)]);              // added line ×3
+    let b = await billOf(bill);
+    const added = b.items[1];
+
+    const ret = await call(processReturn, adminUser(businessId), { params: { id: bill._id }, body: { items: [{ itemId: String(added._id), quantity: 3, reason: "changed_mind" }] } });
+    assert.equal(ret.statusCode, 200, JSON.stringify(ret.body));
+    b = await billOf(bill);
+    assert.equal(String(b.returns[0].items[0].itemId), String(added._id), "the return records its line");
+    assert.deepEqual(b.items.map((i) => i.returnedQty), [0, 3]);
+    assert.equal(await stockOf(ketchup), 48, "3 back on the shelf");
+
+    const cancel = await call(cancelReturn, adminUser(businessId), { params: { id: String(bill._id), returnId: String(b.returns[0]._id) } });
+    assert.equal(cancel.statusCode, 200, JSON.stringify(cancel.body));
+    b = await billOf(bill);
+    assert.deepEqual(b.items.map((i) => i.returnedQty), [0, 0], "the added line is restored, not the morning one");
+    assert.equal(b.amountDue, 750);
+    assert.equal(b.returnStatus, "none");
+    assert.equal(await stockOf(ketchup), 45);
+
+    const again = await call(processReturn, adminUser(businessId), { params: { id: bill._id }, body: { items: [{ itemId: String(added._id), quantity: 3, reason: "changed_mind" }] } });
+    assert.equal(again.statusCode, 200, "those 3 can be returned again");
+}));
+
+test("an older return without a recorded line still cancels the line that was really returned", withBusiness(async (businessId) => {
+    const ketchup = await product(businessId, "Ketchup", 150);
+    const ali = await newCustomer(businessId);
+    const bill = await sale(businessId, ali, [line(ketchup, 2)]);
+    await addItems(businessId, bill, ali, [line(ketchup, 3)]);
+    let b = await billOf(bill);
+    await call(processReturn, adminUser(businessId), { params: { id: bill._id }, body: { items: [{ itemId: String(b.items[1]._id), quantity: 3, reason: "changed_mind" }] } });
+    // make it look like a return saved before this fix
+    await Bill.collection.updateOne({ _id: new mongoose.Types.ObjectId(String(bill._id)) }, { $unset: { "returns.0.items.0.itemId": "" } });
+    b = await billOf(bill);
+    assert.equal(b.returns[0].items[0].itemId, undefined);
+
+    await call(cancelReturn, adminUser(businessId), { params: { id: String(bill._id), returnId: String(b.returns[0]._id) } });
+    assert.deepEqual((await billOf(bill)).items.map((i) => i.returnedQty), [0, 0], "picks the line that has 3 returned");
+}));
+
+test("bill discount + an earlier return → can't add (leftover due); bill discount without a return → can", withBusiness(async (businessId) => {
+    const A = await product(businessId, "Item A", 100, 50, 50);
+    const B = await product(businessId, "Item B", 100, 50, 50);
+    const C = await product(businessId, "Item C", 200, 50, 100);
+    const ali = await newCustomer(businessId);
+
+    const clean = await sale(businessId, ali, [line(A, 1), line(B, 1)], { billDiscountAmount: 20 });
+    let r = await addItems(businessId, clean, ali, [line(C, 1)]);
+    assert.equal(r.statusCode, 200, "no return yet → allowed");
+    // returning everything afterwards adds up exactly
+    const b1 = await billOf(clean);
+    await call(processReturn, adminUser(businessId), { params: { id: clean._id }, body: { fullReturn: true } });
+    assert.equal((await billOf(clean)).amountDue, 0, `full return of ${b1.total} leaves nothing due`);
+
+    const withReturn = await sale(businessId, ali, [line(A, 1), line(B, 1)], { billDiscountAmount: 20 });
+    await call(processReturn, adminUser(businessId), { params: { id: withReturn._id }, body: { items: [{ itemId: String(withReturn.items[0]._id), quantity: 1, reason: "changed_mind" }] } });
+    r = await addItems(businessId, await billOf(withReturn), ali, [line(C, 1)]);
+    assert.equal(r.statusCode, 400);
+    assert.equal(r.body.message, "This bill has a bill discount and a return. Make a new bill.");
+
+    const open = (await call(getOpenBillsForCustomer, adminUser(businessId), { params: { customerId: String(ali) } })).body;
+    const row = open.bills.find((x) => x.billNumber === withReturn.billNumber);
+    assert.equal(row.canAmend, false);
+    assert.equal(row.blockedReason, "This bill has a bill discount and a return. Make a new bill.");
 }));

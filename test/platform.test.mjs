@@ -36,6 +36,8 @@ import productRouter from "../routes/product.mjs";
 import authRouter from "../routes/auth.mjs";
 import adminAuthRouter from "../routes/adminAuth.mjs";
 import businessRouter from "../routes/business.mjs";
+import adminRouter from "../routes/admin.mjs";
+import { authorize } from "../middleware/rbac.mjs";
 import { employeeAuthRouter } from "../routes/employee.mjs";
 import { jwtAuth } from "../middleware/jwtAuth.mjs";
 import { checkBusinessStatus, accountStatus } from "../middleware/businessStatus.mjs";
@@ -52,13 +54,14 @@ before(async () => {
     await mongoose.connect(process.env.MONGODB_URI);
     const app = express();
     app.use(json());
-    const shopAuth = [jwtAuth, checkBusinessStatus, trackUsage];
+    const shopAuth = [jwtAuth, trackUsage, checkBusinessStatus];
     app.use("/adminAuth", adminAuthRouter);
     app.use("/employeeAuth", employeeAuthRouter);
     app.use("/auth", authRouter);
     app.use("/business", businessRouter);
     app.use("/platform", platformRouter);
     app.get("/account/status", jwtAuth, accountStatus);
+    app.use("/admin", ...shopAuth, authorize("admin", "owner"), adminRouter);
     app.use("/bill", ...shopAuth, accessControl, billRouter);
     app.use("/product", ...shopAuth, accessControl, productRouter);
     await new Promise((resolve) => { server = app.listen(0, resolve); });
@@ -485,4 +488,112 @@ test("sorting: name is case-insensitive, shops without paid-until come last; his
     } finally {
         await Business.deleteMany({ _id: { $in: made.map((b) => b._id) } });
     }
+}));
+
+test("private subscription fields never reach a shop (settings save, logins, business page)", withShop(async (shop) => {
+    const { token: panel } = await panelUser();
+    const id = shop.business._id;
+    await post(`/platform/businesses/${id}/warn`, { message: "Payment due soon", paidUntil: "2026-12-01", contact: "Call 0300" }, panel);
+    await http("PATCH", `/platform/businesses/${id}/subscription`, { token: panel, body: { notes: "Pays late, be strict", monthlyFee: 3000 } });
+
+    const hidden = (label, sub) => {
+        assert.ok(sub, `${label}: subscription present`);
+        assert.equal(sub.notes, undefined, `${label}: notes`);
+        assert.equal(sub.history, undefined, `${label}: history`);
+        assert.equal(sub.monthlyFee, undefined, `${label}: monthlyFee`);
+        assert.equal(sub.status, "warning", `${label}: the shop still sees its own status`);
+    };
+
+    const ownerLoginRes = await ownerLogin(shop);
+    hidden("owner login", ownerLoginRes.body.business.subscription);
+    hidden("employee login", (await employeeLogin(shop)).body.business.subscription);
+    const owner = ownerLoginRes.body.token;
+    hidden("GET /business/:id", (await get(`/business/${id}`, owner)).body.subscription);
+
+    const saved = await http("PUT", "/admin/business/settings", { token: owner, body: { settings: { language: "en" }, taxLabel: "GST" } });
+    assert.equal(saved.status, 200, JSON.stringify(saved.body));
+    hidden("PUT /admin/business/settings", saved.body.subscription);
+    assert.equal(saved.body.taxLabel, "GST");
+
+    // Safety net: any full Business document serialised to JSON drops them too
+    hidden("Business toJSON", JSON.parse(JSON.stringify(await Business.findById(id))).subscription);
+
+    // …while the panel still sees everything
+    const d = (await get(`/platform/businesses/${id}`, panel)).body;
+    assert.equal(d.subscription.notes, "Pays late, be strict");
+    assert.equal(d.subscription.monthlyFee, 3000);
+    assert.ok(d.subscriptionHistory.length >= 2);
+}));
+
+test("viewing a customer's rates in the panel never deletes them (inactive product)", withShop(async (shop) => {
+    const { token } = await panelUser();
+    const customer = await Customer.create({
+        business: shop.business._id, name: "Zed", phone: uid(),
+        specialRates: [{ product: shop.product._id, rate: 120, priceWhenSaved: 150 }],
+    });
+    await Product.updateOne({ _id: shop.product._id }, { $set: { isActive: false } });
+
+    const r = await get(`/platform/businesses/${shop.business._id}/customers/${customer._id}/rates`, token);
+    assert.equal(r.status, 200);
+    await new Promise((res) => setTimeout(res, 800)); // the old cleanup ran after the response
+    assert.equal((await Customer.findById(customer._id).lean()).specialRates.length, 1, "rate kept");
+}));
+
+test("P2/P3 fixes: login spam isn't recorded, isActive must be boolean, revoked refresh tokens refused, blocked calls counted, day summary money", withShop(async (shop) => {
+    const { token, user } = await panelUser();
+
+    // unknown email → no audit row; known email with a wrong password → recorded
+    const ghost = `ghost-${uid()}@example.com`;
+    await post("/platform/auth/login", { email: ghost, password: "x" });
+    assert.equal(await PlatformAudit.countDocuments({ "details.email": ghost }), 0);
+    await post("/platform/auth/login", { email: user.email, password: "wrong" });
+    assert.equal(await PlatformAudit.countDocuments({ action: "auth.login_failed", "details.email": user.email }), 1);
+
+    // isActive must be a real boolean
+    const support = await panelUser("support");
+    const bad = await http("PATCH", `/platform/admins/${support.user._id}`, { token, body: { isActive: "true" } });
+    assert.equal(bad.status, 400);
+    assert.equal((await PlatformAdmin.findById(support.user._id).lean()).isActive, true, "not disabled by mistake");
+
+    // a refresh token from before "revoke sessions" (e.g. created in the race) is refused
+    const session = (await ownerLogin(shop)).body;
+    await new Promise((r) => setTimeout(r, 50));
+    await post(`/platform/businesses/${shop.business._id}/revoke-sessions`, {}, token);
+    const before = new Date((await Business.findById(shop.business._id).lean()).subscription.sessionsRevokedAt.getTime() - 1000);
+    const raced = { token: `race-${uid()}`, user: shop.owner._id, userType: "admin", businessId: shop.business._id, expiresAt: new Date(Date.now() + 86400000), createdAt: before, updatedAt: before };
+    await RefreshToken.collection.insertOne({ ...raced });
+    const refused = await post("/auth/refresh", { refreshToken: raced.token });
+    assert.equal(refused.status, 401);
+    assert.equal(refused.body.code, "SESSION_REVOKED");
+    assert.equal((await post("/auth/refresh", { refreshToken: session.refreshToken })).status, 401);
+
+    // blocked API calls are counted in usage
+    await new Promise((r) => setTimeout(r, 1100));
+    const owner = (await ownerLogin(shop)).body.token;
+    await post(`/platform/businesses/${shop.business._id}/block`, { reason: "test" }, token);
+    for (let i = 0; i < 3; i++) assert.equal((await get("/bill", owner)).status, 403);
+    await settle();
+    const usage = (await get(`/platform/businesses/${shop.business._id}/usage?days=1`, token)).body.days[0];
+    assert.ok(usage.blockedRequests >= 3, JSON.stringify(usage));
+    await post(`/platform/businesses/${shop.business._id}/unblock`, {}, token);
+
+    // day summary: "paid" = real money taken that day only
+    const yesterday = new Date(Date.now() - 86400000);
+    const old = await new Bill({
+        billNumber: 50, business: shop.business._id, type: "sale", status: "completed", cashierName: "Owner",
+        items: [{ product: shop.product._id, name: "Ketchup", qty: 2, price: 150, costPrice: 100 }],
+        payments: [
+            { amount: 100, method: "cash", paidAt: yesterday },                                          // taken that day
+            { amount: 50, method: "cash", paidAt: new Date() },                                          // collected later
+            { amount: 30, method: "store_credit", paidAt: yesterday, creditFrom: shop.bills[0]._id },   // not money
+        ],
+    }).save();
+    await Bill.collection.updateOne({ _id: old._id }, { $set: { createdAt: yesterday } });
+    const day = new Date(yesterday.getTime());
+    const key = `${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, "0")}-${String(day.getDate()).padStart(2, "0")}`;
+    const s = (await get(`/platform/businesses/${shop.business._id}/bills-summary?date=${key}`, token)).body;
+    assert.equal(s.bills, 1);
+    assert.equal(s.paid, 100);
+    assert.equal(s.paidByStoreCredit, 30);
+    assert.deepEqual(s.byPaymentMethod, [{ method: "cash", payments: 1, amount: 100 }]);
 }));

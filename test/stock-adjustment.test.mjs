@@ -265,3 +265,20 @@ test("stock-movements: manual rows carry note + reason; filter by type and reaso
     r = await movementsList(businessId, { reason: "lost" });
     assert.equal(r.statusCode, 400);
 }));
+
+test("clean messages and numbers sent as text", withBusiness(async (businessId) => {
+    const p = await newProduct(businessId);
+    for (const [body, message] of [
+        [{ quantity: 5, operation: "add", reason: "" }, "Reason is required"],
+        [{ quantity: 5, operation: "add", reason: null }, "Reason is required"],
+    ]) {
+        const r = await adjust(p, body, admin(businessId));
+        assert.equal(r.statusCode, 400);
+        assert.equal(r.body.message, message, JSON.stringify(body));
+    }
+    const r = await adjust(p, { quantity: "5", operation: "add", reason: "count_correction" }, admin(businessId));
+    assert.equal(r.statusCode, 200);
+    assert.equal(r.body.product.stockQuantity, 25);
+    assert.equal(r.body.movement.quantity, 5);
+    assert.equal(typeof r.body.movement.quantity, "number");
+}));

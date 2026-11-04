@@ -1,7 +1,7 @@
 import 'dotenv/config';
 
 import mongoose from 'mongoose';
-import Business from '../models/business.mjs';
+import Business, { SHOP_HIDDEN_BUSINESS_FIELDS } from '../models/business.mjs';
 import Admin from '../models/admin.mjs';
 import BusinessType from '../models/businessType.mjs';
 
@@ -11,9 +11,6 @@ import bcrypt from 'bcrypt';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-
-// Platform-only fields a shop never sees (internal notes, block history)
-const PLATFORM_PRIVATE = '-subscription.notes -subscription.history -subscription.monthlyFee';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -150,7 +147,7 @@ export const getBusinessById = async (req, res) => {
         }
 
         const business = await Business.findById(id)
-            .select(PLATFORM_PRIVATE)
+            .select(SHOP_HIDDEN_BUSINESS_FIELDS)
             .populate('businessType', 'name code icon features');
 
         if (!business) {
@@ -177,7 +174,7 @@ export const updateBusiness = async (req, res) => {
         const updates = req.body;
 
         const business = await Business.findByIdAndUpdate(id, updates, { new: true })
-            .select(PLATFORM_PRIVATE)
+            .select(SHOP_HIDDEN_BUSINESS_FIELDS)
             .populate('businessType', 'name code icon');
 
         if (!business) {

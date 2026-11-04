@@ -26,10 +26,15 @@ authRouter.post('/refresh', validate(refreshTokenSchema), async (req, res) => {
         console.log('[Auth Refresh] Request received');
 
         // Blocked business → refuse without rotating (the session works again after unblock)
-        const pending = await RefreshToken.findOne({ token: refreshToken }).select('businessId').lean();
+        const pending = await RefreshToken.findOne({ token: refreshToken }).select('businessId createdAt').lean();
         if (pending?.businessId) {
             const status = await getBusinessStatus(pending.businessId);
             if (status?.status === 'blocked') return res.status(403).json(blockedResponse(status));
+            // Issued before the platform ended this shop's sessions → log in again
+            if (status?.sessionsRevokedAt && new Date(pending.createdAt) <= new Date(status.sessionsRevokedAt)) {
+                await RefreshToken.deleteOne({ token: refreshToken });
+                return res.status(401).json({ message: 'Your session has ended. Please log in again.', code: 'SESSION_REVOKED' });
+            }
         }
 
         console.log('[Auth Refresh] Verifying and rotating token...');

@@ -2,6 +2,7 @@ import 'dotenv/config';
 
 import Admin from '../models/admin.mjs';
 import RefreshToken from '../models/refreshToken.mjs';
+import { SHOP_HIDDEN_BUSINESS_FIELDS } from '../models/business.mjs';
 import { getBusinessStatus, blockedResponse } from '../middleware/businessStatus.mjs';
 import { recordUsage } from '../middleware/usageTracker.mjs';
 
@@ -51,7 +52,7 @@ const login = async (req, res) => {
         const getAdmin = await Admin.findOne({ email: req.body.email })
             .populate({
                 path: 'business',
-                select: '-subscription.notes -subscription.history -subscription.monthlyFee',
+                select: SHOP_HIDDEN_BUSINESS_FIELDS,
                 populate: {
                     path: 'businessType',
                     select: 'name code icon features'

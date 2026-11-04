@@ -271,10 +271,11 @@ export const updateStockSchema = Joi.object({
             "number.base": "Quantity must be a number",
             "number.integer": "Quantity must be a whole number",
         }),
-    reason: Joi.string().valid(...ADJUSTMENT_REASON_CODES).required()
+    reason: Joi.string().empty(Joi.valid("", null)).valid(...ADJUSTMENT_REASON_CODES).required()
         .messages({
             "any.required": "Reason is required",
             "string.empty": "Reason is required",
+            "string.base": "Reason is required",
             "any.only": `Reason must be one of: ${ADJUSTMENT_REASON_CODES.join(", ")}`,
         }),
     note: Joi.string().trim().max(NOTE_MAX_LENGTH).allow("")

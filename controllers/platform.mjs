@@ -135,13 +135,15 @@ export const platformLogin = async (req, res) => {
         const admin = await PlatformAdmin.findOne({ email });
         const ok = admin && admin.isActive && (await bcrypt.compare(password, admin.password));
         if (!ok) {
-            audit(req, 'auth.login_failed', { details: { email } });
+            // Only failed sign-ins to real panel accounts are recorded, so spam
+            // with made-up emails can't fill the audit log
+            if (admin) await audit(req, 'auth.login_failed', { details: { email } });
             return res.status(401).json({ message: 'Invalid credentials' });
         }
         admin.lastLoginAt = new Date();
         await admin.save();
         req.platformAdmin = { id: String(admin._id), name: admin.name, email: admin.email, role: admin.role };
-        audit(req, 'auth.login');
+        await audit(req, 'auth.login');
         res.json({ token: signPlatformToken(admin), admin: publicAdmin(admin) });
     } catch (error) {
         console.error('[Platform] login', error);
@@ -151,16 +153,27 @@ export const platformLogin = async (req, res) => {
 
 /** POST /platform/auth/logout — ends every session of this panel user (all devices). */
 export const platformLogout = async (req, res) => {
-    await PlatformAdmin.updateOne({ _id: req.platformAdmin.id }, { $inc: { tokenVersion: 1 } });
-    invalidatePlatformUser(req.platformAdmin.id);
-    audit(req, 'auth.logout');
-    res.json({ message: 'Signed out' });
+    try {
+        await PlatformAdmin.updateOne({ _id: req.platformAdmin.id }, { $inc: { tokenVersion: 1 } });
+        invalidatePlatformUser(req.platformAdmin.id);
+        await audit(req, 'auth.logout');
+        res.json({ message: 'Signed out' });
+    } catch (error) {
+        console.error('[Platform] logout', error);
+        res.status(500).json({ message: 'Failed to sign out' });
+    }
 };
 
 /** GET /platform/auth/me */
 export const platformMe = async (req, res) => {
-    const admin = await PlatformAdmin.findById(req.platformAdmin.id).lean();
-    res.json({ admin: publicAdmin(admin) });
+    try {
+        const admin = await PlatformAdmin.findById(req.platformAdmin.id).lean();
+        if (!admin) return res.status(401).json({ message: 'Account not found', code: 'PLATFORM_USER_DISABLED' });
+        res.json({ admin: publicAdmin(admin) });
+    } catch (error) {
+        console.error('[Platform] me', error);
+        res.status(500).json({ message: 'Failed to load your account' });
+    }
 };
 
 /** POST /platform/auth/change-password { currentPassword, newPassword } */
@@ -178,7 +191,7 @@ export const platformChangePassword = async (req, res) => {
         admin.tokenVersion = (admin.tokenVersion || 0) + 1; // other sessions end
         await admin.save();
         invalidatePlatformUser(admin._id);
-        audit(req, 'auth.change_password');
+        await audit(req, 'auth.change_password');
         res.json({ message: 'Password changed', token: signPlatformToken(admin) }); // this session continues with the new token
     } catch (error) {
         console.error('[Platform] change password', error);
@@ -577,6 +590,14 @@ export const getBillsSummary = async (req, res) => {
         const to = endOfDay(date);
         const tz = getTimezone();
         const match = { business: req.shop._id, type: 'sale', createdAt: { $gte: from, $lte: to } };
+        // A payment counts as money taken that day only if it was taken that
+        // day and is real money (not store credit moved from another bill)
+        const paidOn = { $ifNull: ['$$p.paidAt', '$createdAt'] };
+        const isCredit = { $ifNull: ['$$p.creditFrom', false] };
+        const sumPayments = (cond) => ({
+            $sum: { $map: { input: { $filter: { input: { $ifNull: ['$payments', []] }, as: 'p', cond } }, as: 'p', in: '$$p.amount' } },
+        });
+        const takenThatDay = { $and: [{ $gte: [paidOn, from] }, { $lte: [paidOn, to] }, { $not: [isCredit] }] };
 
         const [r] = await Bill.aggregate([
             { $match: match },
@@ -587,7 +608,9 @@ export const getBillsSummary = async (req, res) => {
                         { $match: { status: 'completed' } },
                         {
                             $group: {
-                                _id: null, count: { $sum: 1 }, total: { $sum: '$total' }, paid: { $sum: '$amountPaid' },
+                                _id: null, count: { $sum: 1 }, total: { $sum: '$total' },
+                                paid: { $sum: sumPayments(takenThatDay) },
+                                storeCredit: { $sum: sumPayments(isCredit) },
                                 credit: { $sum: { $cond: [{ $gt: ['$amountDue', 0] }, '$amountDue', 0] } },
                                 profit: { $sum: '$netProfit' }, discount: { $sum: '$totalDiscount' }, items: { $sum: '$totalQty' },
                                 withCustomer: { $sum: { $cond: [{ $ifNull: ['$customer', false] }, 1, 0] } },
@@ -608,6 +631,17 @@ export const getBillsSummary = async (req, res) => {
                     byMethod: [
                         { $match: { status: 'completed' } },
                         { $unwind: '$payments' },
+                        {
+                            $match: {
+                                'payments.creditFrom': { $in: [null] },
+                                $expr: {
+                                    $and: [
+                                        { $gte: [{ $ifNull: ['$payments.paidAt', '$createdAt'] }, from] },
+                                        { $lte: [{ $ifNull: ['$payments.paidAt', '$createdAt'] }, to] },
+                                    ],
+                                },
+                            },
+                        },
                         { $group: { _id: { $ifNull: ['$payments.method', 'cash'] }, count: { $sum: 1 }, amount: { $sum: '$payments.amount' } } },
                         { $sort: { amount: -1 } },
                     ],
@@ -620,7 +654,8 @@ export const getBillsSummary = async (req, res) => {
             date,
             bills: c.count || 0,
             sales: round2(c.total),
-            paid: round2(c.paid),
+            paid: round2(c.paid),                // real money taken that day on these bills
+            paidByStoreCredit: round2(c.storeCredit), // store credit moved in from other bills (not money)
             creditGiven: round2(c.credit),
             profit: round2(c.profit),
             discount: round2(c.discount),
@@ -651,7 +686,7 @@ const changeSubscription = async (req, res, { action, set, reason, details = {} 
             { new: true }
         ).lean();
         invalidateBusinessStatus(req.shop._id);
-        audit(req, `business.${action}`, { business: req.shop, details: { reason: reason || '', ...details } });
+        await audit(req, `business.${action}`, { business: req.shop, details: { reason: reason || '', ...details } });
         res.json({ businessId: updated._id, name: updated.name, subscription: subscriptionView(updated) });
     } catch (error) {
         console.error(`[Platform] ${action}`, error);
@@ -721,10 +756,23 @@ export const updateSubscription = (req, res) => {
 
 /** POST /platform/businesses/:businessId/revoke-sessions { reason? } — logs everyone in this shop out */
 export const revokeSessions = async (req, res) => {
-    const { deletedCount } = await RefreshToken.deleteMany({ businessId: req.shop._id });
+    let at;
+    let deletedCount = 0;
+    try {
+        // 1) Mark the time first: from now on every token issued before it —
+        //    access or refresh — is refused, so nothing slips through step 2
+        at = new Date();
+        await Business.updateOne({ _id: req.shop._id }, { $set: { 'subscription.sessionsRevokedAt': at } });
+        invalidateBusinessStatus(req.shop._id);
+        // 2) Then remove the refresh tokens issued before it
+        ({ deletedCount } = await RefreshToken.deleteMany({ businessId: req.shop._id, createdAt: { $lte: at } }));
+    } catch (error) {
+        console.error('[Platform] revoke sessions', error);
+        return res.status(500).json({ message: 'Failed to end sessions' });
+    }
     return changeSubscription(req, res, {
         action: 'revoke_sessions',
-        set: { sessionsRevokedAt: new Date() },
+        set: { sessionsRevokedAt: at },
         reason: String(req.body.reason || '').trim(),
         details: { refreshTokensRemoved: deletedCount },
     });
@@ -758,8 +806,13 @@ export const getAuditLog = async (req, res) => {
 
 /** GET /platform/admins */
 export const listPlatformAdmins = async (req, res) => {
-    const admins = await PlatformAdmin.find({}).sort({ createdAt: 1 }).lean();
-    res.json({ admins: admins.map(publicAdmin) });
+    try {
+        const admins = await PlatformAdmin.find({}).sort({ createdAt: 1 }).lean();
+        res.json({ admins: admins.map(publicAdmin) });
+    } catch (error) {
+        console.error('[Platform] list admins', error);
+        res.status(500).json({ message: 'Failed to load panel users' });
+    }
 };
 
 /** POST /platform/admins { name, email, password, role } */
@@ -776,7 +829,7 @@ export const createPlatformAdmin = async (req, res) => {
         if (await PlatformAdmin.exists({ email })) return res.status(409).json({ message: 'A panel user with this email already exists' });
 
         const admin = await PlatformAdmin.create({ name, email, role, password: await bcrypt.hash(password, 10) });
-        audit(req, 'admin.create', { details: { email, role } });
+        await audit(req, 'admin.create', { details: { email, role } });
         res.status(201).json({ admin: publicAdmin(admin) });
     } catch (error) {
         console.error('[Platform] create admin', error);
@@ -797,7 +850,10 @@ export const updatePlatformAdmin = async (req, res) => {
             if (!['superadmin', 'support'].includes(req.body.role)) return res.status(400).json({ message: 'role must be superadmin or support' });
             changes.role = req.body.role;
         }
-        if (req.body.isActive !== undefined) changes.isActive = req.body.isActive === true;
+        if (req.body.isActive !== undefined) {
+            if (typeof req.body.isActive !== 'boolean') return res.status(400).json({ message: 'isActive must be true or false' });
+            changes.isActive = req.body.isActive;
+        }
         if (req.body.password !== undefined) {
             if (String(req.body.password).length < 8) return res.status(400).json({ message: 'Password must be at least 8 characters' });
         }
@@ -816,7 +872,7 @@ export const updatePlatformAdmin = async (req, res) => {
         if (endSessions) admin.tokenVersion = (admin.tokenVersion || 0) + 1;
         await admin.save();
         invalidatePlatformUser(admin._id);
-        audit(req, 'admin.update', { details: { adminId: String(admin._id), email: admin.email, ...changes, passwordChanged: req.body.password !== undefined } });
+        await audit(req, 'admin.update', { details: { adminId: String(admin._id), email: admin.email, ...changes, passwordChanged: req.body.password !== undefined } });
         res.json({ admin: publicAdmin(admin) });
     } catch (error) {
         console.error('[Platform] update admin', error);

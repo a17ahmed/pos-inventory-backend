@@ -141,6 +141,24 @@ const businessSchema = new Schema(
     { timestamps: true }
 );
 
+// Platform-only subscription fields a shop must never see (internal notes,
+// block/warn history with panel staff names, the fee). Shop-facing queries
+// exclude them with SHOP_HIDDEN_BUSINESS_FIELDS; as a safety net they are also
+// stripped whenever a Business document is serialised to JSON. The platform
+// panel reads Business with .lean() / aggregate, which bypasses this.
+export const SHOP_HIDDEN_BUSINESS_FIELDS = '-subscription.notes -subscription.history -subscription.monthlyFee';
+
+businessSchema.set('toJSON', {
+    transform: (doc, ret) => {
+        if (ret.subscription) {
+            delete ret.subscription.notes;
+            delete ret.subscription.history;
+            delete ret.subscription.monthlyFee;
+        }
+        return ret;
+    },
+});
+
 const Business = mongoose.model("Business", businessSchema);
 
 export default Business;

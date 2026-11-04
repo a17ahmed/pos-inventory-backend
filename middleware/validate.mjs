@@ -18,7 +18,10 @@ const validate = (schema, { readableMessage = false } = {}) => (req, res, next) 
         }));
 
         return res.status(400).json({
-            message: readableMessage ? errors.map((e) => e.message).join(". ") : "Validation failed",
+            // readable: the first message per field ("Reason is required", not two joined)
+            message: readableMessage
+                ? errors.filter((e, i) => errors.findIndex((x) => x.field === e.field) === i).map((e) => e.message).join(". ")
+                : "Validation failed",
             errors,
         });
     }

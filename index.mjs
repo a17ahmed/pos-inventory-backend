@@ -241,7 +241,8 @@ app.use("/business", businessRouter);
 app.use("/platform", platformRouter);
 
 // Every shop request: valid token → business not blocked → usage counted
-const shopAuth = [jwtAuth, checkBusinessStatus, trackUsage];
+// trackUsage before checkBusinessStatus so blocked requests are counted too
+const shopAuth = [jwtAuth, trackUsage, checkBusinessStatus];
 
 // Account status for the shop apps' lock screen / warning banner.
 // Deliberately NOT behind checkBusinessStatus so it works while blocked.
