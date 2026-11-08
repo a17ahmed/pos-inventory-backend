@@ -130,6 +130,7 @@ export const updateBusinessSettingsSchema = Joi.object({
         autoSendToKitchen: Joi.boolean(),
         allowSellBelowCost: Joi.boolean(),
         allowBillAmend: Joi.boolean(),
+        autoPrint: Joi.boolean(),
     }),
     cashTaxRate: Joi.number().min(0).max(100),
     cardTaxRate: Joi.number().min(0).max(100),
