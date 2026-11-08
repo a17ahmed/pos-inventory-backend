@@ -92,8 +92,12 @@ const updateBusinessSettings = async (req, res) => {
 
         // Build update object
         const updateData = {};
+        // Merge each sent key with dot-notation so a partial update (e.g. only
+        // { autoPrint: false }) doesn't wipe the other toggles back to defaults.
         if (settings) {
-            updateData.settings = settings;
+            for (const [key, value] of Object.entries(settings)) {
+                updateData[`settings.${key}`] = value;
+            }
         }
         if (cashTaxRate !== undefined) {
             updateData.cashTaxRate = cashTaxRate;

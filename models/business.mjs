@@ -100,7 +100,11 @@ const businessSchema = new Schema(
             allowSellBelowCost: { type: Boolean, default: false },
             // Let the POS add items to a registered customer's credit bill from
             // today instead of making a new bill (POST /bill/:id/add-items)
-            allowBillAmend: { type: Boolean, default: false }
+            allowBillAmend: { type: Boolean, default: false },
+            // Print the receipt automatically when a bill is saved. Off = the
+            // cashier prints manually with the Print button. Default on to keep
+            // the existing behaviour for current shops.
+            autoPrint: { type: Boolean, default: true }
         },
         isActive: {
             type: Boolean,
